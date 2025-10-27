@@ -1,0 +1,33 @@
+{
+  "C_Cpp.default.compilerPath": "C:/msys64/mingw64/bin/gcc.exe",
+  "C_Cpp.default.cStandard": "c17",
+  "C_Cpp.default.cppStandard": "c++20",
+  "C_Cpp.default.intelliSenseMode": "gcc-x64",
+  "C_Cpp.default.includePath": [
+    "${workspaceFolder}/**",
+    "C:/msys64/mingw64/include",
+    "C:/msys64/mingw64/include/c++/*",
+    "C:/msys64/mingw64/include/boost",
+    "C:/msys64/mingw64/include/openssl"
+  ],
+  "files.associations": {
+    "*.hh": "cpp",
+    "*.cc": "cpp",
+    "*.h": "c"
+  },
+  "terminal.integrated.profiles.windows": {
+    "MSYS2 MinGW64": {
+      "path": "C:\\msys64\\mingw64.exe",
+      "icon": "terminal-bash"
+    },
+    "MSYS2 UCRT64": {
+      "path": "C:\\msys64\\ucrt64.exe",
+      "icon": "terminal-bash"
+    },
+    "PowerShell": {
+      "path": "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+    }
+  },
+  "terminal.integrated.defaultProfile.windows": "MSYS2 MinGW64"
+}
+
