@@ -26,6 +26,11 @@
 
 #include "namespaces.hh"
 
+// Undefine Windows macros that conflict with our names
+#ifdef IN
+#undef IN
+#endif
+
 /** The QType class is meant to deal easily with the different kind of resource types, like 'A', 'NS',
  *  'CNAME' etcetera. These types have both a name and a number. This class can seamlessly move between
  *   them. Use it like this:
@@ -197,11 +202,11 @@ struct QClass
 private:
   uint16_t qclass;
 };
-
-constexpr QClass QClass::IN(1);
-constexpr QClass QClass::CHAOS(3);
-constexpr QClass QClass::NONE(254);
-constexpr QClass QClass::ANY(255);
+// Static member definitions (inline to avoid multiple definitions)
+inline constexpr QClass QClass::IN{1};
+inline constexpr QClass QClass::CHAOS{3};
+inline constexpr QClass QClass::NONE{254};
+inline constexpr QClass QClass::ANY{255};
 
 inline std::ostream& operator<<(std::ostream& s, QClass qclass)
 {

@@ -23,7 +23,11 @@
 #include <cinttypes>
 #include <cstring>
 #include <cstdio>
+#ifdef _WIN32
+#include "regex_compat.hh"
+#else
 #include <regex.h>
+#endif
 #include <climits>
 #include <type_traits>
 
@@ -33,9 +37,18 @@
 #include <atomic>
 #include <sys/time.h>
 #include <sys/types.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/socket.h>
+#endif
 #include <ctime>
+#ifdef _WIN32
+#include "windows-compat.h"  // Provides syslog defines
+#else
 #include <syslog.h>
+#endif
 #include <stdexcept>
 #include <string>
 #include <cctype>

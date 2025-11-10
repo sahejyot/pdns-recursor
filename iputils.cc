@@ -26,12 +26,18 @@
 #include "iputils.hh"
 
 #include <fstream>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include "windows-compat.h"
+#else
 #include <sys/socket.h>
-#include <boost/format.hpp>
-
 #ifdef HAVE_GETIFADDRS
 #include <ifaddrs.h>
 #endif
+#endif
+#include <boost/format.hpp>
 
 /** these functions provide a very lightweight wrapper to the Berkeley sockets API. Errors -> exceptions! */
 
@@ -82,7 +88,11 @@ int SConnectWithTimeout(int sockfd, const ComboAddress& remote, const struct tim
         if (error) {
           savederrno = 0;
           socklen_t errlen = sizeof(savederrno);
+#ifdef _WIN32
+          if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, (char*)&savederrno, &errlen) == 0) {
+#else
           if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, (void*)&savederrno, &errlen) == 0) {
+#endif
             NetworkErr("connecting to " + remote.toStringWithPort() + " failed: " + stringerror(savederrno));
           }
           else {
@@ -142,7 +152,11 @@ int SListen(int sockfd, int limit)
 
 int SSetsockopt(int sockfd, int level, int opname, int value)
 {
+#ifdef _WIN32
+  int ret = setsockopt(sockfd, level, opname, (const char*)&value, sizeof(value));
+#else
   int ret = setsockopt(sockfd, level, opname, &value, sizeof(value));
+#endif
   if (ret < 0) {
     RuntimeError("setsockopt for level " + std::to_string(level) + " and opname " + std::to_string(opname) + " to " + std::to_string(value) + " failed: " + stringerror());
   }
@@ -251,6 +265,7 @@ bool HarvestTimestamp(struct msghdr* msgh, struct timeval* timeval)
 #endif
   return false;
 }
+#ifndef _WIN32
 bool HarvestDestinationAddress(const struct msghdr* msgh, ComboAddress* destination)
 {
   destination->reset();
@@ -286,6 +301,7 @@ bool HarvestDestinationAddress(const struct msghdr* msgh, ComboAddress* destinat
   return false;
   // NOLINTEND(cppcoreguidelines-pro-type-cstyle-cast, cppcoreguidelines-pro-bounds-pointer-arithmetic, cppcoreguidelines-pro-type-const-cast, cppcoreguidelines-pro-type-reinterpret-cast)
 }
+#endif // !_WIN32
 
 bool IsAnyAddress(const ComboAddress& addr)
 {
@@ -298,6 +314,7 @@ bool IsAnyAddress(const ComboAddress& addr)
   return false;
 }
 
+#ifndef _WIN32
 int sendOnNBSocket(int fileDesc, const struct msghdr* msgh)
 {
   int sendErr = 0;
@@ -320,10 +337,12 @@ int sendOnNBSocket(int fileDesc, const struct msghdr* msgh)
 #endif
   return sendErr;
 }
+#endif // !_WIN32
 
 // be careful: when using this for receive purposes, make sure addr->sin4.sin_family is set appropriately so getSocklen works!
 // be careful: when using this function for *send* purposes, be sure to set cbufsize to 0!
 // be careful: if you don't call addCMsgSrcAddr after fillMSGHdr, make sure to set msg_control to NULL
+#ifndef _WIN32
 void fillMSGHdr(struct msghdr* msgh, struct iovec* iov, cmsgbuf_aligned* cbuf, size_t cbufsize, char* data, size_t datalen, ComboAddress* addr)
 {
   iov->iov_base = data;
@@ -339,6 +358,7 @@ void fillMSGHdr(struct msghdr* msgh, struct iovec* iov, cmsgbuf_aligned* cbuf, s
   msgh->msg_iovlen = 1;
   msgh->msg_flags = 0;
 }
+#endif // !_WIN32
 
 // warning: various parts of PowerDNS assume 'truncate' will never throw
 void ComboAddress::truncate(unsigned int bits) noexcept
@@ -372,6 +392,7 @@ void ComboAddress::truncate(unsigned int bits) noexcept
   *place &= (~((1 << bitsleft) - 1));
 }
 
+#ifndef _WIN32
 size_t sendMsgWithOptions(int socketDesc, const void* buffer, size_t len, const ComboAddress* dest, const ComboAddress* local, unsigned int localItf, int flags)
 {
   msghdr msgh{};
@@ -455,6 +476,7 @@ size_t sendMsgWithOptions(int socketDesc, const void* buffer, size_t len, const 
 
   return 0;
 }
+#endif // !_WIN32
 
 template class NetmaskTree<bool, Netmask>;
 
@@ -539,13 +561,21 @@ void setSocketBuffer(int fileDesc, int optname, uint32_t size)
   uint32_t psize = 0;
   socklen_t len = sizeof(psize);
 
+#ifdef _WIN32
+  if (getsockopt(fileDesc, SOL_SOCKET, optname, (char*)&psize, &len) != 0) {
+#else
   if (getsockopt(fileDesc, SOL_SOCKET, optname, &psize, &len) != 0) {
+#endif
     throw std::runtime_error("Unable to retrieve socket buffer size:" + stringerror());
   }
   if (psize >= size) {
     return;
   }
+#ifdef _WIN32
+  if (setsockopt(fileDesc, SOL_SOCKET, optname, (const char*)&size, sizeof(size)) != 0) {
+#else
   if (setsockopt(fileDesc, SOL_SOCKET, optname, &size, sizeof(size)) != 0) {
+#endif
     throw std::runtime_error("Unable to raise socket buffer size to " + std::to_string(size) + ": " + stringerror());
   }
 }

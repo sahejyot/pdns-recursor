@@ -20,6 +20,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 #pragma once
+#ifdef _WIN32
+#undef IN  // Windows defines IN macro, conflicts with QClass::IN
+#endif
 #include <string>
 #include <vector>
 #include <map>
@@ -28,7 +31,12 @@
 #include "namespaces.hh"
 #include "iputils.hh"
 #include "svc-records.hh"
+#ifdef IN
+#undef IN
+#endif
+#ifndef _WIN32
 #include <arpa/inet.h>
+#endif
 
 
 /** this class can be used to write DNS packets. It knows about DNS in the sense that it makes

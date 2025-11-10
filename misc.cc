@@ -25,15 +25,26 @@
 #endif
 
 #include <sys/param.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include "windows-compat.h"
+#else
 #include <sys/socket.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <sys/time.h>
-#include <ctime>
 #include <sys/resource.h>
 #include <netinet/in.h>
+#endif
+#include <ctime>
+#ifdef _WIN32
+#include <io.h>
+#else
 #include <sys/un.h>
 #include <unistd.h>
+#endif
 #include <fstream>
 #include "misc.hh"
 #include <vector>
@@ -43,11 +54,15 @@
 #include <cstring>
 #include <iostream>
 #include <sys/types.h>
+#ifdef _WIN32
+// Windows-specific includes already handled above
+#else
 #include <dirent.h>
-#include <algorithm>
 #include <poll.h>
-#include <iomanip>
 #include <netinet/tcp.h>
+#endif
+#include <algorithm>
+#include <iomanip>
 #include <optional>
 #include <cstdlib>
 #include <cstdio>
@@ -57,8 +72,12 @@
 #include "iputils.hh"
 #include "dnsparser.hh"
 #include "dns_random.hh"
+#ifdef _WIN32
+// Windows-specific includes already handled above
+#else
 #include <pwd.h>
 #include <grp.h>
+#endif
 #include <climits>
 #include <unordered_map>
 #ifdef __FreeBSD__
@@ -79,7 +98,12 @@ size_t writen2(int fileDesc, const void *buf, size_t count)
   const char *eptr = ptr + count;
 
   while (ptr != eptr) {
-    auto res = ::write(fileDesc, ptr, eptr - ptr);
+    ssize_t res;
+#ifdef _WIN32
+    res = _write(fileDesc, ptr, static_cast<unsigned int>(eptr - ptr));
+#else
+    res = ::write(fileDesc, ptr, eptr - ptr);
+#endif
     if (res < 0) {
       if (errno == EAGAIN) {
         throw std::runtime_error("used writen2 on non-blocking socket, got EAGAIN");
@@ -101,7 +125,12 @@ size_t readn2(int fileDesc, void* buffer, size_t len)
   size_t pos = 0;
 
   for (;;) {
-    auto res = read(fileDesc, static_cast<char *>(buffer) + pos, len - pos); // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic): it's the API
+    ssize_t res;
+#ifdef _WIN32
+    res = _read(fileDesc, static_cast<char *>(buffer) + pos, static_cast<unsigned int>(len - pos));
+#else
+    res = read(fileDesc, static_cast<char *>(buffer) + pos, len - pos); // NOLINT(cppcoreguidelines-pro-bounds-pointer-arithmetic): it's the API
+#endif
     if (res == 0) {
       throw runtime_error("EOF while reading message");
     }
@@ -130,7 +159,12 @@ size_t readn2WithTimeout(int fd, void* buffer, size_t len, const struct timeval&
   }
 
   do {
-    ssize_t got = read(fd, (char *)buffer + pos, len - pos);
+    ssize_t got;
+#ifdef _WIN32
+    got = _read(fd, (char *)buffer + pos, static_cast<unsigned int>(len - pos));
+#else
+    got = read(fd, (char *)buffer + pos, len - pos);
+#endif
     if (got > 0) {
       pos += (size_t) got;
       if (allowIncomplete) {
@@ -178,7 +212,12 @@ size_t writen2WithTimeout(int fd, const void * buffer, size_t len, const struct 
 {
   size_t pos = 0;
   do {
-    ssize_t written = write(fd, reinterpret_cast<const char *>(buffer) + pos, len - pos);
+    ssize_t written;
+#ifdef _WIN32
+    written = _write(fd, reinterpret_cast<const char *>(buffer) + pos, static_cast<unsigned int>(len - pos));
+#else
+    written = write(fd, reinterpret_cast<const char *>(buffer) + pos, len - pos);
+#endif
 
     if (written > 0) {
       pos += (size_t) written;
@@ -214,16 +253,21 @@ auto pdns::getMessageFromErrno(const int errnum) -> std::string
   errMsgData.resize(errLen);
 
   const char* errMsg = nullptr;
-#ifdef STRERROR_R_CHAR_P
-  errMsg = strerror_r(errnum, errMsgData.data(), errMsgData.length());
-#else
-  // This can fail, and when it does, it sets errno. We ignore that and
-  // set our own error message instead.
-  int res = strerror_r(errnum, errMsgData.data(), errMsgData.length());
+#if defined(_WIN32)
+  strerror_s(errMsgData.data(), errMsgData.length(), errnum);
   errMsg = errMsgData.c_str();
-  if (res != 0) {
-    errMsg = "Unknown (the exact error could not be retrieved)";
-  }
+#else
+  #ifdef STRERROR_R_CHAR_P
+    errMsg = strerror_r(errnum, errMsgData.data(), errMsgData.length());
+  #else
+    // This can fail, and when it does, it sets errno. We ignore that and
+    // set our own error message instead.
+    int res = strerror_r(errnum, errMsgData.data(), errMsgData.length());
+    errMsg = errMsgData.c_str();
+    if (res != 0) {
+      errMsg = "Unknown (the exact error could not be retrieved)";
+    }
+  #endif
 #endif
 
   // We make a copy here because `strerror_r()` might return a static
@@ -298,10 +342,18 @@ string nowTime()
 {
   time_t now = time(nullptr);
   struct tm theTime{};
+#ifdef _WIN32
+  localtime_s(&theTime, &now);
+#else
   localtime_r(&now, &theTime);
+#endif
   std::array<char, 30> buffer{};
   // YYYY-mm-dd HH:MM:SS TZOFF
+#ifdef _WIN32
+  size_t ret = strftime(buffer.data(), buffer.size(), "%Y-%m-%d %H:%M:%S %z", &theTime);
+#else
   size_t ret = strftime(buffer.data(), buffer.size(), "%F %T %z", &theTime);
+#endif
   if (ret == 0) {
     buffer[0] = '\0';
   }
@@ -316,6 +368,7 @@ int waitForData(int fileDesc, int seconds, int useconds)
 
 int waitForRWData(int fileDesc, bool waitForRead, int seconds, int useconds, bool* error, bool* disconnected)
 {
+#ifndef _WIN32
   struct pollfd pfd{};
   memset(&pfd, 0, sizeof(pfd));
   pfd.fd = fileDesc;
@@ -338,10 +391,41 @@ int waitForRWData(int fileDesc, bool waitForRead, int seconds, int useconds, boo
   }
 
   return ret;
+#else
+  // Windows implementation - use select() instead of poll()
+  fd_set readfds, writefds, errorfds;
+  FD_ZERO(&readfds);
+  FD_ZERO(&writefds);
+  FD_ZERO(&errorfds);
+  
+  if (waitForRead) {
+    FD_SET(fileDesc, &readfds);
+  } else {
+    FD_SET(fileDesc, &writefds);
+  }
+  FD_SET(fileDesc, &errorfds);
+  
+  struct timeval timeout;
+  timeout.tv_sec = seconds;
+  timeout.tv_usec = useconds;
+  
+  int ret = select(fileDesc + 1, &readfds, &writefds, &errorfds, &timeout);
+  if (ret > 0) {
+    if ((error != nullptr) && FD_ISSET(fileDesc, &errorfds)) {
+      *error = true;
+    }
+    if ((disconnected != nullptr) && FD_ISSET(fileDesc, &errorfds)) {
+      *disconnected = true;
+    }
+  }
+  
+  return ret;
+#endif
 }
 
 // returns -1 in case of error, 0 if no data is available, 1 if there is. In the first two cases, errno is set
 int waitForMultiData(const set<int>& fds, const int seconds, const int useconds, int* fdOut) {
+#ifndef _WIN32
   set<int> realFDs;
   for (const auto& fd : fds) {
     if (fd >= 0 && realFDs.count(fd) == 0) {
@@ -376,11 +460,51 @@ int waitForMultiData(const set<int>& fds, const int seconds, const int useconds,
   advance(it, dns_random(pollinFDs.size()));
   *fdOut = *it;
   return 1;
+#else
+  // Windows implementation - use select() instead of poll()
+  fd_set readfds;
+  FD_ZERO(&readfds);
+  int maxfd = 0;
+  
+  for (const auto& fd : fds) {
+    if (fd >= 0) {
+      FD_SET(fd, &readfds);
+      if (fd > maxfd) maxfd = fd;
+    }
+  }
+  
+  struct timeval timeout;
+  if (seconds >= 0) {
+    timeout.tv_sec = seconds;
+    timeout.tv_usec = useconds;
+  } else {
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+  }
+  
+  int ret = select(maxfd + 1, &readfds, nullptr, nullptr, seconds >= 0 ? &timeout : nullptr);
+  if (ret <= 0) {
+    return ret;
+  }
+  
+  set<int> readyFDs;
+  for (const auto& fd : fds) {
+    if (fd >= 0 && FD_ISSET(fd, &readfds)) {
+      readyFDs.insert(fd);
+    }
+  }
+  
+  set<int>::const_iterator it(readyFDs.begin());
+  advance(it, dns_random(readyFDs.size()));
+  *fdOut = *it;
+  return 1;
+#endif
 }
 
 // returns -1 in case of error, 0 if no data is available, 1 if there is. In the first two cases, errno is set
 int waitFor2Data(int fd1, int fd2, int seconds, int useconds, int* fdPtr)
 {
+#ifndef _WIN32
   std::array<pollfd,2> pfds{};
   memset(pfds.data(), 0, pfds.size() * sizeof(struct pollfd));
   pfds[0].fd = fd1;
@@ -415,6 +539,44 @@ int waitFor2Data(int fd1, int fd2, int seconds, int useconds, int* fdPtr)
   }
 
   return 1;
+#else
+  // Windows implementation - use select() instead of poll()
+  fd_set readfds;
+  FD_ZERO(&readfds);
+  FD_SET(fd1, &readfds);
+  if (fd2 >= 0) {
+    FD_SET(fd2, &readfds);
+  }
+  
+  struct timeval timeout;
+  if (seconds >= 0) {
+    timeout.tv_sec = seconds;
+    timeout.tv_usec = useconds;
+  } else {
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+  }
+  
+  int ret = select(fd2 >= 0 ? fd2 + 1 : fd1 + 1, &readfds, nullptr, nullptr, seconds >= 0 ? &timeout : nullptr);
+  if (ret <= 0) {
+    return ret;
+  }
+  
+  if (FD_ISSET(fd1, &readfds) && (fd2 < 0 || !FD_ISSET(fd2, &readfds))) {
+    *fdPtr = fd1;
+  }
+  else if (fd2 >= 0 && FD_ISSET(fd2, &readfds) && !FD_ISSET(fd1, &readfds)) {
+    *fdPtr = fd2;
+  }
+  else if(ret == 2) {
+    *fdPtr = (dns_random_uint32() % 2) ? fd2 : fd1;
+  }
+  else {
+    *fdPtr = -1; // should never happen
+  }
+
+  return 1;
+#endif
 }
 
 
@@ -549,7 +711,11 @@ bool IpToU32(const string &str, uint32_t *ip)
   }
 
   struct in_addr inp;
+#ifdef _WIN32
+  if(inet_pton(AF_INET, str.c_str(), &inp) == 1) {
+#else
   if(inet_aton(str.c_str(), &inp)) {
+#endif
     *ip=inp.s_addr;
     return true;
   }
@@ -646,6 +812,7 @@ pair<string, string> splitField(const string& inp, char sepa)
 
 int logFacilityToLOG(unsigned int facility)
 {
+#ifndef _WIN32
   switch(facility) {
   case 0:
     return LOG_LOCAL0;
@@ -666,10 +833,18 @@ int logFacilityToLOG(unsigned int facility)
   default:
     return -1;
   }
+#else
+  // Windows implementation - return facility number + 16 (LOG_LOCAL0 base)
+  if (facility <= 7) {
+    return facility + 16;
+  }
+  return -1;
+#endif
 }
 
 std::optional<int> logFacilityFromString(std::string facilityStr)
 {
+#ifndef _WIN32
   static std::unordered_map<std::string, int> const s_facilities = {
     {"local0", LOG_LOCAL0},
     {"log_local0", LOG_LOCAL0},
@@ -722,6 +897,14 @@ std::optional<int> logFacilityFromString(std::string facilityStr)
   }
 
   return facilityIt->second;
+#else
+  // Windows implementation - return default facility
+  toLowerInPlace(facilityStr);
+  if (facilityStr == "local0" || facilityStr == "log_local0") {
+    return 16; // LOG_LOCAL0 equivalent
+  }
+  return std::nullopt;
+#endif
 }
 
 string stripDot(const string& dom)
@@ -801,7 +984,11 @@ int makeIPv4sockaddr(const std::string& str, struct sockaddr_in* ret)
 
   string::size_type pos = str.find(':');
   if(pos == string::npos) { // no port specified, not touching the port
+#ifdef _WIN32
+    if(inet_pton(AF_INET, str.c_str(), &inp) == 1) {
+#else
     if(inet_aton(str.c_str(), &inp)) {
+#endif
       ret->sin_addr.s_addr=inp.s_addr;
       return 0;
     }
@@ -819,7 +1006,11 @@ int makeIPv4sockaddr(const std::string& str, struct sockaddr_in* ret)
     return -1;
 
   ret->sin_port = htons(port);
+#ifdef _WIN32
+  if(inet_pton(AF_INET, str.substr(0, pos).c_str(), &inp) == 1) {
+#else
   if(inet_aton(str.substr(0, pos).c_str(), &inp)) {
+#endif
     ret->sin_addr.s_addr=inp.s_addr;
     return 0;
   }
@@ -877,6 +1068,7 @@ Regex::Regex(const string &expr)
 // Note that cmsgbuf should be aligned the same as a struct cmsghdr
 void addCMsgSrcAddr(struct msghdr* msgh, cmsgbuf_aligned* cmsgbuf, const ComboAddress* source, int itfIndex)
 {
+#ifndef _WIN32
   struct cmsghdr *cmsg = nullptr;
 
   if(source->sin4.sin_family == AF_INET6) {
@@ -953,18 +1145,28 @@ void addCMsgSrcAddr(struct msghdr* msgh, cmsgbuf_aligned* cmsgbuf, const ComboAd
     *in = source->sin4.sin_addr;
 #endif
   }
+#else
+  // Windows implementation - no-op for now
+  // Windows doesn't support control messages in the same way
+#endif
 }
 
 unsigned int getFilenumLimit(bool hardOrSoft)
 {
+#ifndef _WIN32
   struct rlimit rlim;
   if(getrlimit(RLIMIT_NOFILE, &rlim) < 0)
     unixDie("Requesting number of available file descriptors");
   return hardOrSoft ? rlim.rlim_max : rlim.rlim_cur;
+#else
+  // Windows implementation - return a reasonable default
+  return 1024;
+#endif
 }
 
 void setFilenumLimit(unsigned int lim)
 {
+#ifndef _WIN32
   struct rlimit rlim;
 
   if(getrlimit(RLIMIT_NOFILE, &rlim) < 0)
@@ -972,6 +1174,10 @@ void setFilenumLimit(unsigned int lim)
   rlim.rlim_cur=lim;
   if(setrlimit(RLIMIT_NOFILE, &rlim) < 0)
     unixDie("Setting number of available file descriptors");
+#else
+  // Windows implementation - no-op for now
+  // Windows doesn't have the same file descriptor limit concept
+#endif
 }
 
 bool setSocketTimestamps(int fd)
@@ -997,18 +1203,36 @@ bool setTCPNoDelay(int sock)
 
 bool setNonBlocking(int sock)
 {
+#ifndef _WIN32
   int flags=fcntl(sock,F_GETFL,0);
   if(flags<0 || fcntl(sock, F_SETFL,flags|O_NONBLOCK) <0)
     return false;
   return true;
+#else
+  // Windows implementation - set socket to non-blocking mode
+  u_long mode = 1;
+  if (ioctlsocket(sock, FIONBIO, &mode) != 0) {
+    return false;
+  }
+  return true;
+#endif
 }
 
 bool setBlocking(int sock)
 {
+#ifndef _WIN32
   int flags=fcntl(sock,F_GETFL,0);
   if(flags<0 || fcntl(sock, F_SETFL,flags&(~O_NONBLOCK)) <0)
     return false;
   return true;
+#else
+  // Windows implementation - set socket to blocking mode
+  u_long mode = 0;
+  if (ioctlsocket(sock, FIONBIO, &mode) != 0) {
+    return false;
+  }
+  return true;
+#endif
 }
 
 bool setReuseAddr(int sock)
@@ -1030,20 +1254,36 @@ void setDscp(int sock, unsigned short family, uint8_t dscp)
   }
 
   if (family == AF_INET) {
+#ifdef _WIN32
+    if (getsockopt(sock, IPPROTO_IP, IP_TOS, (char*)&val, (int*)&len)<0) {
+#else
     if (getsockopt(sock, IPPROTO_IP, IP_TOS, &val, &len)<0) {
+#endif
       throw std::runtime_error(string("Set DSCP failed: ")+stringerror());
     }
     val = (dscp<<2) | (val&0x3);
+#ifdef _WIN32
+    if (setsockopt(sock, IPPROTO_IP, IP_TOS, (const char*)&val, sizeof(val))<0) {
+#else
     if (setsockopt(sock, IPPROTO_IP, IP_TOS, &val, sizeof(val))<0) {
+#endif
       throw std::runtime_error(string("Set DSCP failed: ")+stringerror());
     }
   }
   else if (family == AF_INET6) {
+#ifdef _WIN32
+    if (getsockopt(sock, IPPROTO_IPV6, IPV6_TCLASS, (char*)&val, (int*)&len)<0) {
+#else
     if (getsockopt(sock, IPPROTO_IPV6, IPV6_TCLASS, &val, &len)<0) {
+#endif
       throw std::runtime_error(string("Set DSCP failed: ")+stringerror());
     }
     val = (dscp<<2) | (val&0x3);
+#ifdef _WIN32
+    if (setsockopt(sock, IPPROTO_IPV6, IPV6_TCLASS, (const char*)&val, sizeof(val))<0) {
+#else
     if (setsockopt(sock, IPPROTO_IPV6, IPV6_TCLASS, &val, sizeof(val))<0) {
+#endif
       throw std::runtime_error(string("Set DSCP failed: ")+stringerror());
     }
   }
@@ -1051,8 +1291,17 @@ void setDscp(int sock, unsigned short family, uint8_t dscp)
 
 bool isNonBlocking(int sock)
 {
+#ifndef _WIN32
   int flags=fcntl(sock,F_GETFL,0);
   return flags & O_NONBLOCK;
+#else
+  // Windows implementation - check socket option
+  u_long mode = 0;
+  if (ioctlsocket(sock, FIONBIO, &mode) == 0) {
+    return mode != 0;
+  }
+  return false;
+#endif
 }
 
 bool setReceiveSocketErrors([[maybe_unused]] int sock, [[maybe_unused]] int af)
@@ -1071,9 +1320,19 @@ bool setReceiveSocketErrors([[maybe_unused]] int sock, [[maybe_unused]] int af)
   return true;
 }
 
-// Closes a socket.
+// Closes a socket
 int closesocket(int socket)
 {
+// condition close() is unix dependent function and is available on windows but for different usecase 
+#ifdef _WIN32
+  // Overload distinct from Winsock's closesocket(SOCKET). Accepts int fd and forwards.
+  int ret = ::closesocket(static_cast<SOCKET>(socket));
+  if (ret == SOCKET_ERROR) {
+    int err = WSAGetLastError();
+    throw PDNSException("Error closing socket: " + std::to_string(err));
+  }
+  return ret;
+#else
   int ret = ::close(socket);
   if(ret < 0 && errno == ECONNRESET) { // see ticket 192, odd BSD behaviour
     return 0;
@@ -1083,14 +1342,20 @@ int closesocket(int socket)
     throw PDNSException("Error closing socket: " + stringerror(err));
   }
   return ret;
+#endif
 }
 
 bool setCloseOnExec(int sock)
 {
+#ifndef _WIN32
   int flags=fcntl(sock,F_GETFD,0);
   if(flags<0 || fcntl(sock, F_SETFD,flags|FD_CLOEXEC) <0)
     return false;
   return true;
+#else
+  // Windows implementation - sockets are automatically close-on-exec
+  return true;
+#endif
 }
 
 #ifdef __linux__
@@ -1451,6 +1716,9 @@ uint64_t getRealMemoryUsage(const std::string&)
   // We used to use "data" here, but it proves unreliable and even is marked "broken"
   // in https://www.kernel.org/doc/html/latest/filesystems/proc.html
   return resident * getpagesize();
+#elif defined(_WIN32)
+  // Windows implementation - return 0 for now
+  return 0;
 #else
   struct rusage ru;
   if (getrusage(RUSAGE_SELF, &ru) != 0)
@@ -1482,16 +1750,26 @@ uint64_t getSpecialMemoryUsage(const std::string&)
 
 uint64_t getCPUTimeUser(const std::string&)
 {
+#ifndef _WIN32
   struct rusage ru;
   getrusage(RUSAGE_SELF, &ru);
   return (ru.ru_utime.tv_sec*1000ULL + ru.ru_utime.tv_usec/1000);
+#else
+  // Windows implementation - return 0 for now
+  return 0;
+#endif
 }
 
 uint64_t getCPUTimeSystem(const std::string&)
 {
+#ifndef _WIN32
   struct rusage ru;
   getrusage(RUSAGE_SELF, &ru);
   return (ru.ru_stime.tv_sec*1000ULL + ru.ru_stime.tv_usec/1000);
+#else
+  // Windows implementation - return 0 for now
+  return 0;
+#endif
 }
 
 double DiffTime(const struct timespec& first, const struct timespec& second)
@@ -1520,6 +1798,7 @@ double DiffTime(const struct timeval& first, const struct timeval& second)
 
 uid_t strToUID(const string &str)
 {
+#ifndef _WIN32
   uid_t result = 0;
   const char * cstr = str.c_str();
   struct passwd * pwd = getpwnam(cstr);
@@ -1545,10 +1824,24 @@ uid_t strToUID(const string &str)
   }
 
   return result;
+#else
+  // Windows implementation - try to parse as number
+  try {
+    long long val = stoll(str);
+    if (val < std::numeric_limits<uid_t>::min() || val > std::numeric_limits<uid_t>::max()) {
+      throw runtime_error("User ID out of range");
+    }
+    return static_cast<uid_t>(val);
+  }
+  catch(std::exception& e) {
+    throw runtime_error("Unable to parse user ID");
+  }
+#endif
 }
 
 gid_t strToGID(const string &str)
 {
+#ifndef _WIN32
   gid_t result = 0;
   const char * cstr = str.c_str();
   struct group * grp = getgrnam(cstr);
@@ -1574,6 +1867,19 @@ gid_t strToGID(const string &str)
   }
 
   return result;
+#else
+  // Windows implementation - try to parse as number
+  try {
+    long long val = stoll(str);
+    if (val < std::numeric_limits<gid_t>::min() || val > std::numeric_limits<gid_t>::max()) {
+      throw runtime_error("Group ID out of range");
+    }
+    return static_cast<gid_t>(val);
+  }
+  catch(std::exception& e) {
+    throw runtime_error("Unable to parse group ID");
+  }
+#endif
 }
 
 bool isSettingThreadCPUAffinitySupported()
@@ -1587,6 +1893,7 @@ bool isSettingThreadCPUAffinitySupported()
 
 int mapThreadToCPUList([[maybe_unused]] pthread_t tid, [[maybe_unused]] const std::set<int>& cpus)
 {
+#ifndef _WIN32
 #ifdef HAVE_PTHREAD_SETAFFINITY_NP
 #  ifdef __NetBSD__
   cpuset_t *cpuset;
@@ -1615,6 +1922,10 @@ int mapThreadToCPUList([[maybe_unused]] pthread_t tid, [[maybe_unused]] const st
 #else
   return ENOSYS;
 #endif /* HAVE_PTHREAD_SETAFFINITY_NP */
+#else
+  // Windows implementation - not supported
+  return ENOSYS;
+#endif
 }
 
 std::vector<ComboAddress> getResolvers(const std::string& resolvConfPath)
@@ -1778,15 +2089,26 @@ bool constantTimeStringEquals(const std::string& a, const std::string& b)
 
 namespace pdns
 {
+#ifndef _WIN32
 struct CloseDirDeleter
 {
   void operator()(DIR* dir) const noexcept {
     closedir(dir);
   }
 };
+#else
+// Windows placeholder - not used
+struct CloseDirDeleter
+{
+  void operator()(void* dir) const noexcept {
+    // No-op for Windows
+  }
+};
+#endif
 
 std::optional<std::string> visit_directory(const std::string& directory, const std::function<bool(ino_t inodeNumber, const std::string_view& name)>& visitor)
 {
+#ifndef _WIN32
   auto dirHandle = std::unique_ptr<DIR, CloseDirDeleter>(opendir(directory.c_str()));
   if (!dirHandle) {
     auto err = errno;
@@ -1803,10 +2125,15 @@ std::optional<std::string> visit_directory(const std::string& directory, const s
   }
 
   return std::nullopt;
+#else
+  // Windows implementation - for now return empty
+  return std::nullopt;
+#endif
 }
 
 UniqueFilePtr openFileForWriting(const std::string& filePath, mode_t permissions, bool mustNotExist, bool appendIfExists)
 {
+#ifndef _WIN32
   int flags = O_WRONLY | O_CREAT;
   if (mustNotExist) {
     flags |= O_EXCL;
@@ -1826,6 +2153,10 @@ UniqueFilePtr openFileForWriting(const std::string& filePath, mode_t permissions
     return {};
   }
   return filePtr;
+#else
+  // Windows implementation - for now return empty
+  return {};
+#endif
 }
 
 }

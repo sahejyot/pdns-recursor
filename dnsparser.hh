@@ -38,6 +38,11 @@
 #include "noinitvector.hh"
 #include "pdnsexception.hh"
 #include "iputils.hh"
+
+// Undefine Windows macros that conflict with our names
+#ifdef IN
+#undef IN
+#endif
 #include "svc-records.hh"
 
 /** DNS records have three representations:
@@ -68,7 +73,7 @@ class MOADNSParser;
 class PacketReader
 {
 public:
-  PacketReader(const std::string_view& content, uint16_t initialPos=sizeof(dnsheader), bool internalRepresentation = false)
+  PacketReader(const std::string_view& content, uint16_t initialPos=12 /* DNS_HEADER_WIRE_SIZE */, bool internalRepresentation = false)
     : d_pos(initialPos), d_startrecordpos(initialPos), d_content(content), d_internal(internalRepresentation)
   {
     if(content.size() > std::numeric_limits<uint16_t>::max())

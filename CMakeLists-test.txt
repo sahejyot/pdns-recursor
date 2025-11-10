@@ -1,0 +1,15 @@
+cmake_minimum_required(VERSION 3.20)
+project(libevent-test LANGUAGES CXX)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Windows libraries
+target_link_libraries(test_libevent
+    ws2_32          # Windows sockets
+    event           # libevent
+    event_extra      # libevent extra
+)
+
+

@@ -167,10 +167,10 @@ QType &QType::operator=(const string &s)
 }
 
 static const std::map<const std::string, uint16_t> s_classMap = {
-  {"IN", QClass::IN},
-  {"CHAOS", QClass::CHAOS},
-  {"NONE", QClass::NONE},
-  {"ANY", QClass::ANY},
+  {"IN", 1},      // QClass::IN
+  {"CHAOS", 3},   // QClass::CHAOS
+  {"NONE", 254},  // QClass::NONE
+  {"ANY", 255},   // QClass::ANY
 };
 
 QClass::QClass(const std::string& code)
@@ -185,15 +185,17 @@ QClass::QClass(const std::string& code)
 std::string QClass::toString() const
 {
   switch (qclass) {
-  case IN:
+  case 1:    // QClass::IN
     return "IN";
-  case CHAOS:
+  case 3:    // QClass::CHAOS
     return "CHAOS";
-  case NONE:
+  case 254:  // QClass::NONE
     return "NONE";
-  case ANY:
+  case 255:  // QClass::ANY
     return "ANY";
   default :
     return "CLASS" + std::to_string(qclass);
   }
 }
+
+// Static member definitions moved to qtype.hh as inline constexpr

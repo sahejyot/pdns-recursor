@@ -27,11 +27,7 @@
 #include <utility>
 #include <vector>
 #include <set>
-#ifdef _WIN32
-#include "windows-compat.h"
-#else
 #include <strings.h>
-#endif
 #include <stdexcept>
 #include <sstream>
 #include <iterator>

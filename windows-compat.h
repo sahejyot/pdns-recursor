@@ -14,6 +14,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <io.h>  // For _close()
 
 // MSVC doesn't have strings.h, but string.h provides similar functions
 #include <string.h>
@@ -63,6 +64,32 @@ typedef __int64 ssize_t;
 typedef int ssize_t;
 #endif
 #endif
+
+// Unix close() compatibility - MinGW already provides close() in io.h
+// No need to redefine it
+
+// Unix types not available on Windows
+#ifndef uid_t
+typedef unsigned int uid_t;
+#endif
+#ifndef gid_t
+typedef unsigned int gid_t;
+#endif
+
+// Control message header
+struct msghdr;
+struct cmsghdr {
+  size_t cmsg_len;
+  int cmsg_level;
+  int cmsg_type;
+  /* unsigned char cmsg_data[]; */
+};
+
+// Unix socket address
+struct sockaddr_un {
+  unsigned short sun_family;      // AF_UNIX
+  char sun_path[108];              // Pathname
+};
 
 #endif // _WIN32
 

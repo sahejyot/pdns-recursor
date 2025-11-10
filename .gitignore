@@ -1,0 +1,53 @@
+# Build directories
+build/
+build_*/
+build_msys2/
+build_new/
+build_test/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Compiled object files
+*.o
+*.obj
+*.exe
+*.dll
+*.so
+*.a
+*.lib
+
+# Executables
+pdns_recursor_poc*
+*.pdb
+
+# Log files
+*.log
+build_*.log
+run_test*.log
+server_output.log
+
+# Temporary files
+*.tmp
+*.temp
+temp_files/
+service_pid.txt
+
+# IDE files
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test output
+test_output/
+*.test
+
