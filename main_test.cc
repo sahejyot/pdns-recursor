@@ -30,6 +30,7 @@
 #include <iomanip>
 #include <thread>
 #include "dnsrecords.hh"  // For reportAllTypes
+#include "rec-main.hh"    // For DNSComboWriter (minimal setup)
 
 // Global caches (defined in globals_stub.cc, declared here as extern)
 extern std::unique_ptr<MemRecursorCache> g_recCache;
@@ -144,7 +145,9 @@ static bool parseWireQuestion(const char* data, size_t size, std::string& outQNa
     return true;
 }
 
-// Job structure for passing DNS query context to MTasker task
+// COMMENTED OUT: ResolveJob replaced with DNSComboWriter (matches upstream pattern)
+// DNSComboWriter is now used instead - see rec-main.hh for definition
+/*
 struct ResolveJob {
     evutil_socket_t sock;
     sockaddr_in to;
@@ -154,6 +157,7 @@ struct ResolveJob {
     uint16_t qid;
     uint8_t rd;
 };
+*/
 
 // Forward declaration
 static void resolveTaskFunc(void* pv);
@@ -261,16 +265,47 @@ void handleDNSQuery(int fd, boost::any& param) {
         }
         std::cout << "[DEBUG] Wire parser OK: qname=" << fqdn << ", qtype=" << qtypeWire << ", qclass=" << qclassWire << std::endl;
     }
+    
+    // ========================================================================
+    // Create DNSComboWriter (replaces ResolveJob)
+    // ========================================================================
+    // Create DNSComboWriter with minimal setup (nullptr for luaContext)
+    // This matches upstream pattern: pdns_recursor.cc:2436 - DNSComboWriter creation
+    std::string queryPacket(buffer, bytes_received);
+    struct timeval now;
+    gettimeofday(&now, nullptr);
+    
+    // Create DNSComboWriter with minimal arguments:
+    // - query: raw packet string (MOADNSParser will parse it)
+    // - now: current time
+    // - luaContext: nullptr (minimal setup, no Lua needed)
+    auto comboWriter = std::make_unique<DNSComboWriter>(queryPacket, now, nullptr);
+    
+    // Set address fields (needed for response sending)
+    ComboAddress remoteAddr;
+    remoteAddr.sin4.sin_family = AF_INET;
+    remoteAddr.sin4.sin_addr = client_addr.sin_addr;
+    remoteAddr.sin4.sin_port = client_addr.sin_port;
+    comboWriter->setRemote(remoteAddr);
+    comboWriter->setSource(remoteAddr);
+    comboWriter->setLocal(remoteAddr);
+    comboWriter->setSocket(sockfd);
+    
+    // Verify MOADNSParser parsed correctly (DNSComboWriter constructor uses MOADNSParser)
+    std::cout << "[DEBUG] DNSComboWriter created:" << std::endl;
+    std::cout << "  - qname: " << comboWriter->d_mdp.d_qname.toString() << std::endl;
+    std::cout << "  - qtype: " << comboWriter->d_mdp.d_qtype << std::endl;
+    std::cout << "  - qclass: " << comboWriter->d_mdp.d_qclass << std::endl;
+    std::cout << "  - qid: " << ntohs(comboWriter->d_mdp.d_header.id) << std::endl;
+    std::cout << "  - remote: " << comboWriter->getRemote() << std::endl;
+    
     // Hand off resolution so the event loop can keep running (like upstream)
-    const uint8_t rdflag = (static_cast<uint8_t>(buffer[2]) & 0x01);
-    sockaddr_in replyAddr = client_addr; // copy
-    evutil_socket_t sendSock = sockfd;
-    auto* job = new ResolveJob{ sendSock, replyAddr, fqdn, qtypeWire, qclassWire, qid, rdflag };
+    // Upstream: pdns_recursor.cc:2436-2440 - creates DNSComboWriter and passes to startDoResolve
     if (g_multiTasker) {
-        g_multiTasker->makeThread(resolveTaskFunc, job);
-        std::cout << "[DEBUG] Enqueued resolve task to MTasker" << std::endl;
+        g_multiTasker->makeThread(resolveTaskFunc, comboWriter.release());
+        std::cout << "[DEBUG] Enqueued resolve task to MTasker with DNSComboWriter" << std::endl;
     } else {
-        resolveTaskFunc(job);
+        resolveTaskFunc(comboWriter.release());
     }
     // Return quickly to keep pumping the event loop
 }
@@ -278,6 +313,7 @@ void handleDNSQuery(int fd, boost::any& param) {
 // MTasker task function for DNS resolution
 // CRITICAL: Match upstream pattern exactly - create SyncRes at start, let it be destroyed when function returns
 // Upstream: pdns_recursor.cc:973-2017 - startDoResolve() creates resolver at line 976, uses it throughout, destroys when function returns
+// UPDATED: Now uses DNSComboWriter instead of ResolveJob (matches upstream pattern)
 static void resolveTaskFunc(void* pv) {
     std::cout << "[DEBUG] MT: task started" << std::endl;
     // Ensure thread-local MTasker infrastructure exists in this worker thread
@@ -285,9 +321,10 @@ static void resolveTaskFunc(void* pv) {
         initializeMTaskerInfrastructure();
         std::cout << "[DEBUG] MT: initialized thread-local t_fdm and UDP client socks" << std::endl;
     }
-    std::unique_ptr<ResolveJob> j(static_cast<ResolveJob*>(pv));
-    timeval now{};
-    Utility::gettimeofday(&now, nullptr);
+    // UPDATED: Use DNSComboWriter instead of ResolveJob (matches upstream: pdns_recursor.cc:978)
+    std::unique_ptr<DNSComboWriter> comboWriter(static_cast<DNSComboWriter*>(pv));
+    // Use comboWriter->d_now instead of getting time again (matches upstream pattern)
+    timeval now = comboWriter->d_now;
     
     // Initialize t_sstorage.domainmap if needed (required by getBestAuthZone/getBestNSFromCache)
     if (!SyncRes::t_sstorage.domainmap) {
@@ -325,15 +362,16 @@ static void resolveTaskFunc(void* pv) {
     // CRITICAL: Match upstream pattern - create SyncRes at start of function, destroy when function returns
     // Upstream: pdns_recursor.cc:976 - SyncRes resolver(comboWriter->d_now);
     // Upstream lets resolver be destroyed when startDoResolve() function returns (line 2017)
-    std::cout << "[DEBUG] MT: about to construct SyncRes resolver for " << j->fqdn << std::endl;
+    std::cout << "[DEBUG] MT: about to construct SyncRes resolver for " << comboWriter->d_mdp.d_qname << std::endl;
     SyncRes resolver(now);
-    std::cout << "[DEBUG] MT: SyncRes resolver constructed for " << j->fqdn << std::endl;
+    std::cout << "[DEBUG] MT: SyncRes resolver constructed for " << comboWriter->d_mdp.d_qname << std::endl;
     
     try {
         // Note: We don't set a custom async callback - SyncRes will use the global asyncresolve()
         // function which calls our asendto/arecvfrom functions (like upstream does)
         // Provide client source to resolver (helps ECS/selection)
-        ComboAddress src(std::string(inet_ntoa(j->to.sin_addr)));
+        // UPDATED: Use comboWriter->d_remote instead of j->to
+        ComboAddress src = comboWriter->d_remote;
         resolver.setQuerySource(src, boost::none);
         std::cout << "[DEBUG] MT: query source set" << std::endl;
         // Root hints are already manually primed at startup via primeRootHints()
@@ -341,11 +379,12 @@ static void resolveTaskFunc(void* pv) {
         // with entries that have different cache keys (d_cacheRemote/ednsmask)
         // The manually primed hints use boost::none for both, making them globally accessible
         std::cout << "[DEBUG] MT: Skipping root NS priming via beginResolve (using manually primed hints instead)" << std::endl;
-        std::cout << "[DEBUG] MT: About to resolve: fqdn=\"" << j->fqdn << "\" qtype=" << j->qtype << " qclass=" << j->qclass << std::endl;
-        DNSName queryName(j->fqdn);
+        // UPDATED: Use comboWriter->d_mdp instead of j->fqdn, j->qtype, j->qclass
+        std::cout << "[DEBUG] MT: About to resolve: qname=\"" << comboWriter->d_mdp.d_qname << "\" qtype=" << comboWriter->d_mdp.d_qtype << " qclass=" << comboWriter->d_mdp.d_qclass << std::endl;
+        DNSName queryName = comboWriter->d_mdp.d_qname;
         std::cout << "[DEBUG] MT: DNSName constructed: \"" << queryName << "\" wirelength()=" << queryName.wirelength() << std::endl;
         std::vector<DNSRecord> ret;
-        int rcode = resolver.beginResolve(queryName, QType(j->qtype), QClass(j->qclass), ret);
+        int rcode = resolver.beginResolve(queryName, QType(comboWriter->d_mdp.d_qtype), QClass(comboWriter->d_mdp.d_qclass), ret);
         std::cout << "[DEBUG] MT: beginResolve done: rcode=" << rcode << " (RCode::NXDomain=" << RCode::NXDomain << "), records=" << ret.size() << std::endl;
         // Debug: Log all records for NXDOMAIN
         if (rcode == RCode::NXDomain) {
@@ -355,7 +394,8 @@ static void resolveTaskFunc(void* pv) {
             }
         }
         std::vector<uint8_t> resp;
-        DNSPacketWriter w(resp, DNSName(j->fqdn), j->qtype, j->qclass);
+        // UPDATED: Use comboWriter->d_mdp instead of j->fqdn, j->qtype, j->qclass
+        DNSPacketWriter w(resp, comboWriter->d_mdp.d_qname, comboWriter->d_mdp.d_qtype, comboWriter->d_mdp.d_qclass);
         
         // ========================================================================
         // WINDOWS FIX: DNS Header Padding in Response Construction (main_test.cc)
@@ -380,7 +420,8 @@ static void resolveTaskFunc(void* pv) {
         uint8_t* respPtr = resp.data();
         if (resp.size() >= 12) {
           // Write ID (bytes 0-1) in network byte order
-          uint16_t idNetwork = htons(j->qid);
+          // UPDATED: Use comboWriter->d_mdp.d_header.id instead of j->qid
+          uint16_t idNetwork = htons(comboWriter->d_mdp.d_header.id);
           respPtr[0] = (idNetwork >> 8) & 0xFF;
           respPtr[1] = idNetwork & 0xFF;
           
@@ -394,7 +435,8 @@ static void resolveTaskFunc(void* pv) {
           flags |= 0x0080; // RA=1 (recursion available, bit 7)
           // AA=0 (not authoritative, bit 10) - already 0
           // TC=0 (not truncated, bit 9) - already 0
-          if (j->rd) {
+          // UPDATED: Use comboWriter->d_mdp.d_header.rd instead of j->rd
+          if (comboWriter->d_mdp.d_header.rd) {
             flags |= 0x0100; // RD=1 (recursion desired, bit 8) - echo query RD flag
           }
           flags |= (rcode & 0x0F); // RCODE in bits 3-0
@@ -480,7 +522,8 @@ static void resolveTaskFunc(void* pv) {
           uint16_t nscount = (static_cast<uint16_t>(respPtr[8]) << 8) | static_cast<uint16_t>(respPtr[9]);
           uint16_t arcount = (static_cast<uint16_t>(respPtr[10]) << 8) | static_cast<uint16_t>(respPtr[11]);
           std::cout << "[DEBUG] MT: Response header after commit - raw bytes: qd=[0x" << std::hex << static_cast<unsigned>(respPtr[4]) << " 0x" << static_cast<unsigned>(respPtr[5]) << "] an=[0x" << static_cast<unsigned>(respPtr[6]) << " 0x" << static_cast<unsigned>(respPtr[7]) << std::dec << "]" << std::endl;
-          std::cout << "[DEBUG] MT: Response header after commit - values: id=" << j->qid << " rcode=" << rcode << " qdcount=" << qdcount << " ancount=" << ancount << " nscount=" << nscount << " arcount=" << arcount << " records=" << ret.size() << std::endl;
+          // UPDATED: Use comboWriter->d_mdp.d_header.id instead of j->qid
+          std::cout << "[DEBUG] MT: Response header after commit - values: id=" << ntohs(comboWriter->d_mdp.d_header.id) << " rcode=" << rcode << " qdcount=" << qdcount << " ancount=" << ancount << " nscount=" << nscount << " arcount=" << arcount << " records=" << ret.size() << std::endl;
           if (ancount != static_cast<uint16_t>(ret.size())) {
             std::cerr << "[ERROR] MT: ancount mismatch! ancount=" << ancount << " but ret.size()=" << ret.size() << std::endl;
           }
@@ -488,7 +531,13 @@ static void resolveTaskFunc(void* pv) {
             std::cerr << "[ERROR] MT: qdcount should be 1 but got " << qdcount << std::endl;
           }
         }
-        socklen_t tolen = sizeof(j->to);
+        // UPDATED: Use comboWriter->d_remote and comboWriter->d_socket instead of j->to and j->sock
+        // Convert ComboAddress to sockaddr_in for sendto()
+        sockaddr_in to_addr;
+        to_addr.sin_family = AF_INET;
+        to_addr.sin_addr = comboWriter->d_remote.sin4.sin_addr;
+        to_addr.sin_port = comboWriter->d_remote.sin4.sin_port;
+        socklen_t tolen = sizeof(to_addr);
         std::cout << "[DEBUG] MT: sending response of size " << resp.size() << std::endl;
         // Debug: Hex dump first 100 bytes of response packet
         std::cout << "[DEBUG] MT: Response packet hexdump (first " << (resp.size() < 100 ? resp.size() : 100) << " bytes):";
@@ -496,21 +545,21 @@ static void resolveTaskFunc(void* pv) {
             std::cout << ' ' << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(resp[i]);
         }
         std::cout << std::dec << std::setfill(' ') << std::endl;
-        ssize_t sent = sendto(j->sock, reinterpret_cast<const char*>(resp.data()), static_cast<int>(resp.size()), 0,
-                               reinterpret_cast<sockaddr*>(&j->to), tolen);
+        ssize_t sent = sendto(comboWriter->d_socket, reinterpret_cast<const char*>(resp.data()), static_cast<int>(resp.size()), 0,
+                               reinterpret_cast<sockaddr*>(&to_addr), tolen);
 #ifdef _WIN32
         if (sent < 0) {
             int werr = WSAGetLastError();
-            std::cerr << "MT: sendto() failed (WSA " << werr << ") for " << j->fqdn << ", payload=" << resp.size() << std::endl;
+            std::cerr << "MT: sendto() failed (WSA " << werr << ") for " << comboWriter->d_mdp.d_qname << ", payload=" << resp.size() << std::endl;
         }
 #else
         if (sent < 0) {
-            std::cerr << "MT: sendto() failed (errno=" << errno << ": " << strerror(errno) << ") for " << j->fqdn << ", payload=" << resp.size() << std::endl;
+            std::cerr << "MT: sendto() failed (errno=" << errno << ": " << strerror(errno) << ") for " << comboWriter->d_mdp.d_qname << ", payload=" << resp.size() << std::endl;
         }
 #endif
-        std::cout << "MT: sent wire-parse " << (added ? "ANSWER" : "SERVFAIL") << " (" << sent << " bytes) for " << j->fqdn << " rcode=" << rcode << " records=" << ret.size() << std::endl;
+        std::cout << "MT: sent wire-parse " << (added ? "ANSWER" : "SERVFAIL") << " (" << sent << " bytes) for " << comboWriter->d_mdp.d_qname << " rcode=" << rcode << " records=" << ret.size() << std::endl;
         std::cout.flush(); // Ensure output is flushed
-              std::cout << "[DEBUG] MT: After sendto() for " << j->fqdn << ", resolver will be destroyed when function returns" << std::endl;
+              std::cout << "[DEBUG] MT: After sendto() for " << comboWriter->d_mdp.d_qname << ", resolver will be destroyed when function returns" << std::endl;
               std::cout.flush();
           } catch (const std::exception& e) {
               std::cerr << "MT: exception during resolve/send: " << e.what() << std::endl;
@@ -519,8 +568,9 @@ static void resolveTaskFunc(void* pv) {
           // CRITICAL: Match upstream pattern - resolver is destroyed here when function returns
           // Upstream: pdns_recursor.cc:2017 - function just returns, resolver destructor runs automatically
           // No explicit scope block - let C++ handle destruction when function returns
-          std::string fqdn_copy = j->fqdn; // Capture fqdn before resolver destruction
-          std::cout << "[DEBUG] MT: About to return from task function for " << fqdn_copy << ", resolver will be destroyed" << std::endl;
+          // UPDATED: Use comboWriter->d_mdp.d_qname instead of j->fqdn
+          std::string qname_copy = comboWriter->d_mdp.d_qname.toString(); // Capture qname before resolver destruction
+          std::cout << "[DEBUG] MT: About to return from task function for " << qname_copy << ", resolver will be destroyed" << std::endl;
           std::cout.flush();
           // Resolver goes out of scope here when function returns - destructor will be called
           // If destructor blocks, the function will never return and MTasker won't process new queries

@@ -1,5 +1,4 @@
-// WINDOWS POC: disable full upstream daemon code for now; we will progressively re-enable blocks
-#if 0
+// WINDOWS POC: upstream daemon code enabled - Windows fixes will be added as needed
 /*
  * This file is part of PowerDNS or dnsdist.
  * Copyright -- PowerDNS.COM B.V. and its contributors
@@ -231,7 +230,6 @@ static void handleGenUDPQueryResponse(int fileDesc, FDMultiplexer::funcparam_t& 
     g_multiTasker->sendEvent(pident, &empty);
   }
 }
-#endif // 0 WINDOWS POC disabled block
 
 PacketBuffer GenUDPQueryResponse(const ComboAddress& dest, const string& query)
 {

@@ -209,6 +209,7 @@ if(WIN32)
     set(HAVE_LIBCURL 0)
     set(HAVE_LIBSODIUM 0)
     set(HAVE_LUA 0)
+    add_definitions(-DHAVE_LUA=0)  # Define as preprocessor macro for conditional compilation
     set(HAVE_CLOCK_GETTIME 0)
     set(HAVE_CRYPTO_MEMCMP 0)
     set(HAVE_EXPLICIT_BZERO 0)
