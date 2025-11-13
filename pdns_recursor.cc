@@ -192,7 +192,6 @@ uint32_t capPacketCacheTTL(const dnsheader& /* dh */, uint32_t /* minTTL */, boo
 // Helper function stubs (disabled)
 // NOTE: maxanswersize is uint16_t in startDoResolve, not size_t
 // addRecordToPacket is defined below (line 834) as static, matching upstream pattern
-bool addRecordToPacket(DNSPacketWriter& packetWriter, const DNSRecord& record, uint32_t& minTTL, uint32_t ttlCap, uint16_t maxAnswerSize, bool& seenAuthSOA);
 void addPolicyTagsToPBMessageIfNeeded(const DNSComboWriter& /* comboWriter */, pdns::ProtoZero::RecMessage& /* pbMessage */) { }
 void protobufLogResponse(pdns::ProtoZero::RecMessage& /* pbMessage */) { }
 
@@ -828,10 +827,10 @@ LWResult::Result arecvfrom(PacketBuffer& packet, int /* flags */, const ComboAdd
 // ========================================================================
 // UDP FLOW: addRecordToPacket - helper function for startDoResolve
 // ========================================================================
-// CRITICAL: This function must NOT be static - it's called by startDoResolve
 // This function is ENABLED and must be compiled (moved outside #if 0 block)
+// Matches upstream pattern: static function in same file
 // ========================================================================
-bool addRecordToPacket(DNSPacketWriter& packetWritewr, const DNSRecord& rec, uint32_t& minTTL, uint32_t ttlCap, uint16_t maxAnswerSize, bool& seenAuthSOA)
+static bool addRecordToPacket(DNSPacketWriter& packetWritewr, const DNSRecord& rec, uint32_t& minTTL, uint32_t ttlCap, const uint16_t maxAnswerSize, bool& seenAuthSOA)
 {
   packetWritewr.startRecord(rec.d_name, rec.d_type, (rec.d_ttl > ttlCap ? ttlCap : rec.d_ttl), rec.d_class, rec.d_place);
 
