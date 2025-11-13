@@ -33,6 +33,8 @@
 #include <thread>
 #include "dnsrecords.hh"  // For reportAllTypes
 #include "rec-main.hh"    // For DNSComboWriter (minimal setup)
+#include "logging.hh"     // For Logging::Logger::create
+#include "logr.hh"        // For Logr::Logger
 
 // Global caches (defined in globals_stub.cc, declared here as extern)
 extern std::unique_ptr<MemRecursorCache> g_recCache;
@@ -49,6 +51,7 @@ extern void initializeMTaskerInfrastructure();
 extern void initializeOptionalVariablesForUpstream();
 extern void registerListenSocket(int socketFd, const ComboAddress& address);
 extern void startDoResolve(void* arg);
+extern void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& var);
 
 // Prime root hints into cache (based on putDefaultHintsIntoCache from reczones-helpers.cc)
 static void primeRootHints(time_t now)
@@ -167,7 +170,9 @@ struct ResolveJob {
 // Forward declaration
 static void resolveTaskFunc(void* pv);
 
-// DNS query handler
+// DNS query handler - DEPRECATED: Now using upstream handleNewUDPQuestion instead
+// This function is kept for reference but is no longer used
+#if 0
 void handleDNSQuery(int fd, boost::any& param) {
 #ifdef _WIN32
     using NativeFD = evutil_socket_t;
@@ -315,6 +320,7 @@ void handleDNSQuery(int fd, boost::any& param) {
     }
     // Return quickly to keep pumping the event loop
 }
+#endif // #if 0 - DEPRECATED: Now using upstream handleNewUDPQuestion
 
 // MTasker task function for DNS resolution
 // CRITICAL: Match upstream pattern exactly - create SyncRes at start, let it be destroyed when function returns
@@ -789,7 +795,10 @@ int main() {
 #ifdef _WIN32
         param = static_cast<evutil_socket_t>(g_udp_socket);
 #endif
-        t_fdm->addReadFD(g_udp_socket, handleDNSQuery, param);
+        // Use upstream handleNewUDPQuestion instead of custom handleDNSQuery
+        // handleNewUDPQuestion uses recvmsg() and calls doProcessUDPQuestion -> startDoResolve
+        boost::any udpParam; // Empty param for handleNewUDPQuestion
+        t_fdm->addReadFD(g_udp_socket, handleNewUDPQuestion, udpParam);
         std::cout << "Registered incoming socket with t_fdm multiplexer" << std::endl;
         
         // No direct recv test to avoid consuming datagrams

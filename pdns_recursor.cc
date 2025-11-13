@@ -176,10 +176,20 @@ PolicyResult handlePolicyHit(const DNSFilterEngine::Policy& /* appliedPolicy */,
 // NOTE: luaconfsLocal is actually LocalStateHolder<LuaConfigItems>, not LuaConfigItems&
 bool checkProtobufExport(const LocalStateHolder<LuaConfigItems>& /* luaconfsLocal */) { return false; }
 void checkOutgoingProtobufExport(const LocalStateHolder<LuaConfigItems>& /* luaconfsLocal */) { }
+void protobufLogQuery(const LocalStateHolder<LuaConfigItems>& /* luaconfsLocal */, const boost::uuids::uuid& /* uniqueId */, const ComboAddress& /* source */, const ComboAddress& /* destination */, const ComboAddress& /* mappedSource */, const Netmask& /* ednssubnet */, bool /* tcp */, size_t /* len */, const DNSName& /* qname */, uint16_t /* qtype */, uint16_t /* qclass */, const std::unordered_set<std::string>& /* policyTags */, const string& /* requestorId */, const string& /* deviceId */, const string& /* deviceName */, const std::map<std::string, RecursorLua4::MetaValue>& /* meta */, boost::optional<uint32_t> /* ednsVersion */, const dnsheader& /* dnsheader */) { }
 
 // Tracing stubs (disabled)
 // NOTE: getTrace() returns a string, not vector<string>
 void dumpTrace(const std::string& /* trace */, const struct timeval& /* now */) { }
+
+// Rate limited logger stub (disabled)
+pdns::RateLimitedLog g_rateLimitedLogger;
+
+// Global variables that need to be available (moved outside #if 0 block)
+bool g_gettagNeedsEDNSOptions{false};
+
+// Thread-local storage for g_now (needed for doProcessUDPQuestion)
+__thread struct timeval g_now;
 
 // Statistics stubs (disabled)
 // NOTE: Function name is updateResponseStats (plural) in startDoResolve
@@ -188,6 +198,31 @@ void updateResponseStats(int /* res */, const ComboAddress& /* source */, size_t
 
 // Packet cache stubs (disabled)
 uint32_t capPacketCacheTTL(const dnsheader& /* dh */, uint32_t /* minTTL */, bool /* seenAuthSOA */) { return 0; }
+
+// RecursorPacketCache method implementations (stubs for minimal setup)
+// These are normally in recpacketcache.cc but we provide stubs here
+bool RecursorPacketCache::getResponsePacket(unsigned int /* tag */, const std::string& /* queryPacket */, const DNSName& /* qname */, uint16_t /* qtype */, uint16_t /* qclass */, time_t /* now */, std::string* /* responsePacket */, uint32_t* /* age */, vState* /* valState */, uint32_t* /* qhash */, OptPBData* /* pbdata */, bool /* tcp */)
+{
+  return false; // Stub: packet cache disabled in minimal setup
+}
+
+bool RecursorPacketCache::getResponsePacket(unsigned int /* tag */, const std::string& /* queryPacket */, DNSName& /* qname */, uint16_t* /* qtype */, uint16_t* /* qclass */, time_t /* now */, std::string* /* responsePacket */, uint32_t* /* age */, vState* /* valState */, uint32_t* /* qhash */, OptPBData* /* pbdata */, bool /* tcp */)
+{
+  return false; // Stub: packet cache disabled in minimal setup
+}
+
+// ZoneXFR stub (disabled)
+// ZoneXFR is a class, not a namespace, so we need to provide a stub implementation
+// This will be linked from rec-xfr.cc if available, or we can add a stub here
+// For now, we'll just declare it - the actual implementation should be in rec-xfr.cc
+bool ZoneXFR::notifyZoneTracker(const DNSName& /* name */) { return false; }
+
+// Trace stubs (disabled)
+namespace pdns {
+  namespace trace {
+    void extractOTraceIDs(const EDNSOptionViewMap& /* map */, InitialSpanInfo& /* span */) { }
+  }
+}
 
 // Helper function stubs (disabled)
 // NOTE: maxanswersize is uint16_t in startDoResolve, not size_t
@@ -203,6 +238,12 @@ void finishTCPReply(const std::unique_ptr<DNSComboWriter>& /* comboWriter */, bo
 // RecThreadInfo stub (disabled)
 struct RecThreadInfo {
   static int thread_local_id() { return 0; }
+  static RecThreadInfo& self() {
+    static RecThreadInfo instance;
+    return instance;
+  }
+  void incNumberOfDistributedQueries() { }
+  static bool weDistributeQueries() { return false; }
 };
 
 // RunningResolveGuard stub (disabled)
@@ -830,6 +871,7 @@ LWResult::Result arecvfrom(PacketBuffer& packet, int /* flags */, const ComboAdd
 // This function is ENABLED and must be compiled (moved outside #if 0 block)
 // Matches upstream pattern: static function in same file
 // ========================================================================
+// bool addRecordToPacket(DNSPacketWriter& packetWritewr, const DNSRecord& rec, uint32_t& minTTL, uint32_t ttlCap, uint16_t maxAnswerSize, bool& seenAuthSOA)
 static bool addRecordToPacket(DNSPacketWriter& packetWritewr, const DNSRecord& rec, uint32_t& minTTL, uint32_t ttlCap, const uint16_t maxAnswerSize, bool& seenAuthSOA)
 {
   packetWritewr.startRecord(rec.d_name, rec.d_type, (rec.d_ttl > ttlCap ? ttlCap : rec.d_ttl), rec.d_class, rec.d_place);
@@ -1278,6 +1320,8 @@ static bool dns64Candidate(uint16_t requestedType, int rcode, const std::vector<
   return rcode != RCode::NXDomain;
 }
 
+#endif // #if 0 - Close block before isAllowNotifyForZone
+
 bool isAllowNotifyForZone(DNSName qname)
 {
   if (t_allowNotifyFor->empty()) {
@@ -1323,6 +1367,8 @@ static bool isEnabledForUDRs(const std::shared_ptr<std::vector<std::unique_ptr<F
 }
 #endif // HAVE_FSTRM
 
+#if 0
+// DISABLED: Using stub version instead (line 183)
 static void dumpTrace(const string& trace, const timeval& timev)
 {
   if (trace.empty()) {
@@ -1373,7 +1419,10 @@ static void dumpTrace(const string& trace, const timeval& timev)
   }
   // fclose by unique_ptr does implicit flush
 }
+#endif // #if 0 - dumpTrace disabled (using stub)
 
+#if 0
+// DISABLED: Using stub version instead (line 194)
 static uint32_t capPacketCacheTTL(const struct dnsheader& hdr, uint32_t ttl, bool seenAuthSOA)
 {
   if (hdr.rcode == RCode::NXDomain || (hdr.rcode == RCode::NoError && hdr.ancount == 0 && seenAuthSOA)) {
@@ -1387,6 +1436,7 @@ static uint32_t capPacketCacheTTL(const struct dnsheader& hdr, uint32_t ttl, boo
   }
   return ttl;
 }
+#endif // #if 0 - capPacketCacheTTL disabled (using stub)
 
 static void addPolicyTagsToPBMessageIfNeeded(DNSComboWriter& comboWriter, pdns::ProtoZero::RecMessage& pbMessage)
 {
@@ -1401,8 +1451,6 @@ static void addPolicyTagsToPBMessageIfNeeded(DNSComboWriter& comboWriter, pdns::
     pbMessage.addPolicyTags(comboWriter.d_policyTags);
   }
 }
-
-#endif // #if 0 - End of disabled code (startDoResolve enabled below)
 
 // ========================================================================
 // UDP FLOW: startDoResolve - main DNS resolution function (from upstream)
@@ -1503,11 +1551,10 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
     vector<DNSRecord> ret;
     vector<uint8_t> packet;
 
-#if 0
-    // DISABLED: Lua, Protobuf, Policy/RPZ features (not needed for minimal UDP flow)
+    // ENABLED: Basic Lua, Protobuf configuration setup (needed for variable declarations)
     auto luaconfsLocal = g_luaconfs.getLocal();
     // Used to tell syncres later on if we should apply NSDNAME and NSIP RPZ triggers for this query
-    bool wantsRPZ(true);
+    bool wantsRPZ(false);  // RPZ disabled by default (can be enabled if policy is configured)
     RecursorPacketCache::OptPBData pbDataForCache;
     pdns::ProtoZero::RecMessage pbMessage;
     if (checkProtobufExport(luaconfsLocal)) {
@@ -1521,10 +1568,6 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
 #ifdef HAVE_FSTRM
     checkFrameStreamExport(luaconfsLocal, luaconfsLocal->frameStreamExportConfig, t_frameStreamServersInfo);
     checkFrameStreamExport(luaconfsLocal, luaconfsLocal->nodFrameStreamExportConfig, t_nodFrameStreamServersInfo);
-#endif
-#else
-    // MINIMAL: No Lua, Protobuf, or Policy/RPZ - just core DNS resolution
-    bool wantsRPZ = false;  // RPZ disabled
 #endif
 
     DNSPacketWriter packetWriter(packet, comboWriter->d_mdp.d_qname, comboWriter->d_mdp.d_qtype, comboWriter->d_mdp.d_qclass, comboWriter->d_mdp.d_header.opcode);
@@ -1797,8 +1840,7 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
     /* preresolve expects res (dq.rcode) to be set to RCode::NoError by default */
     int res = RCode::NoError;
 
-#if 0
-    // DISABLED: Lua DNSQuestion and Policy setup (not needed for minimal UDP flow)
+    // ENABLED: Basic DNSQuestion and Policy setup (needed for variable declarations)
     DNSFilterEngine::Policy appliedPolicy;
     RecursorLua4::DNSQuestion dnsQuestion(comboWriter->d_remote, comboWriter->d_local, comboWriter->d_source, comboWriter->d_destination, comboWriter->d_mdp.d_qname, comboWriter->d_mdp.d_qtype, comboWriter->d_tcp, variableAnswer, wantsRPZ, comboWriter->d_logResponse, addPaddingToResponse, (g_useKernelTimestamp && comboWriter->d_kernelTimestamp.tv_sec != 0) ? comboWriter->d_kernelTimestamp : comboWriter->d_now);
     dnsQuestion.ednsFlags = const_cast<const uint16_t*>(&edo.d_extFlags);  // Cast to const for stub compatibility
@@ -1818,10 +1860,6 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
     dnsQuestion.extendedErrorExtra = &comboWriter->d_extendedErrorExtra;
     dnsQuestion.meta = std::move(comboWriter->d_meta);
     dnsQuestion.fromAuthIP = &resolver.d_fromAuthIP;
-#else
-    // MINIMAL: No Lua DNSQuestion or Policy - just core resolution
-    DNSFilterEngine::Policy appliedPolicy;  // Empty policy (no filtering)
-#endif
 
     std::cout << "[DEBUG startDoResolve] Setting up resolver slog" << std::endl;
     std::cout << "[DEBUG startDoResolve] resolver.d_slog pointer: " << (resolver.d_slog ? "not null" : "NULL") << std::endl;
@@ -2890,6 +2928,7 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
 
 #if 0
 // Rest of disabled code continues below (startDoResolve is now enabled above)
+// NOTE: doProcessUDPQuestion and handleNewUDPQuestion are ENABLED (moved outside this block)
 void getQNameAndSubnet(const std::string& question, DNSName* dnsname, uint16_t* qtype, uint16_t* qclass,
                        bool& foundECS, EDNSSubnetOpts* ednssubnet, EDNSOptionViewMap* options, boost::optional<uint32_t>& ednsVersion)
 {
@@ -2998,6 +3037,33 @@ bool checkForCacheHit(bool qnameParsed, unsigned int tag, const string& data,
       }
     }
 
+    // DNS header is always 12 bytes in wire format, regardless of struct packing
+#ifdef _WIN32
+    constexpr size_t DNS_HEADER_SIZE = 12;
+    if (response.length() >= DNS_HEADER_SIZE) {
+      // WINDOWS FIX: dnsheader_aligned copies 14 bytes on Windows, causing misalignment
+      // Use manual parsing similar to handleUDPServerResponse
+      dnsheader dnsheader{};
+      const uint8_t* raw = reinterpret_cast<const uint8_t*>(response.data());
+      memset(&dnsheader, 0, sizeof(dnsheader));
+      memcpy(reinterpret_cast<uint8_t*>(&dnsheader) + 2, raw + 2, 2);  // Copy Flags
+      uint16_t id_raw = (static_cast<uint16_t>(raw[0]) << 8) | static_cast<uint16_t>(raw[1]);
+      dnsheader.id = ntohs(id_raw);
+      uint16_t qdcount_raw = (static_cast<uint16_t>(raw[4]) << 8) | static_cast<uint16_t>(raw[5]);
+      uint16_t ancount_raw = (static_cast<uint16_t>(raw[6]) << 8) | static_cast<uint16_t>(raw[7]);
+      uint16_t nscount_raw = (static_cast<uint16_t>(raw[8]) << 8) | static_cast<uint16_t>(raw[9]);
+      uint16_t arcount_raw = (static_cast<uint16_t>(raw[10]) << 8) | static_cast<uint16_t>(raw[11]);
+      dnsheader.qdcount = qdcount_raw;
+      dnsheader.ancount = ancount_raw;
+      dnsheader.nscount = nscount_raw;
+      dnsheader.arcount = arcount_raw;
+      // ageDNSPacket needs dnsheader_aligned, so create a temporary aligned struct
+      dnsheader_aligned dh_aligned(&dnsheader);
+      ageDNSPacket(response, age, dh_aligned);
+      updateResponseStats(dnsheader.rcode, source, response.length(), nullptr, 0);
+      t_Counters.at(rec::ResponseStats::responseStats).submitResponse(qtype, response.length(), dnsheader.rcode);
+    }
+#else
     if (response.length() >= sizeof(struct dnsheader)) {
       dnsheader_aligned dh_aligned(response.data());
       ageDNSPacket(response, age, dh_aligned);
@@ -3005,6 +3071,7 @@ bool checkForCacheHit(bool qnameParsed, unsigned int tag, const string& data,
       updateResponseStats(dhp->rcode, source, response.length(), nullptr, 0);
       t_Counters.at(rec::ResponseStats::responseStats).submitResponse(qtype, response.length(), dhp->rcode);
     }
+#endif
 
     // we assume 0 usec
     t_Counters.at(rec::DoubleWAvgCounter::avgLatencyUsec).addToRollingAvg(0.0, g_latencyStatSize);
@@ -3056,6 +3123,208 @@ bool expectProxyProtocol(const ComboAddress& from, const ComboAddress& listenAdd
   return false;
 }
 
+#endif // #if 0 - Close block before helper functions
+
+// ========================================================================
+// UDP FLOW: Required helper functions (ENABLED - moved outside #if 0 block)
+// ========================================================================
+// These functions are needed by doProcessUDPQuestion and handleNewUDPQuestion
+
+void getQNameAndSubnet(const std::string& question, DNSName* dnsname, uint16_t* qtype, uint16_t* qclass,
+                       bool& foundECS, EDNSSubnetOpts* ednssubnet, EDNSOptionViewMap* options, boost::optional<uint32_t>& ednsVersion)
+{
+  const dnsheader_aligned dnshead(question.data());
+  const dnsheader* dhPointer = dnshead.get();
+  size_t questionLen = question.length();
+  unsigned int consumed = 0;
+  *dnsname = DNSName(question.c_str(), static_cast<int>(questionLen), sizeof(dnsheader), false, qtype, qclass, &consumed);
+
+  size_t pos = sizeof(dnsheader) + consumed + 4;
+  const size_t headerSize = /* root */ 1 + sizeof(dnsrecordheader);
+  const uint16_t arcount = ntohs(dhPointer->arcount);
+
+  for (uint16_t arpos = 0; arpos < arcount && questionLen >= (pos + headerSize) && !foundECS; arpos++) {
+    if (question.at(pos) != 0) {
+      /* not an OPT, bye. */
+      return;
+    }
+
+    pos += 1;
+    const auto* drh = reinterpret_cast<const dnsrecordheader*>(&question.at(pos)); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+    if (ntohs(drh->d_type) == QType::OPT) {
+      uint32_t edns{};
+      memcpy(&edns, &drh->d_ttl, sizeof(edns)); // drh is not neccesarily aligned, so no uint32 assignment can be done
+      ednsVersion = edns;
+    }
+    pos += sizeof(dnsrecordheader);
+
+    if (pos >= questionLen) {
+      return;
+    }
+
+    /* OPT root label (1) followed by type (2) */
+    if (ntohs(drh->d_type) == QType::OPT) {
+      if (options == nullptr) {
+        size_t ecsStartPosition = 0;
+        size_t ecsLen = 0;
+        /* we need to pass the record len */
+        int res = getEDNSOption(reinterpret_cast<const char*>(&question.at(pos - sizeof(drh->d_clen))), questionLen - pos + sizeof(drh->d_clen), EDNSOptionCode::ECS, &ecsStartPosition, &ecsLen); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+        if (res == 0 && ecsLen > 4) {
+          EDNSSubnetOpts eso;
+          if (EDNSSubnetOpts::getFromString(&question.at(pos - sizeof(drh->d_clen) + ecsStartPosition + 4), ecsLen - 4, &eso)) {
+            *ednssubnet = eso;
+            foundECS = true;
+          }
+        }
+      }
+      else {
+        /* we need to pass the record len */
+        int res = getEDNSOptions(reinterpret_cast<const char*>(&question.at(pos - sizeof(drh->d_clen))), questionLen - pos + (sizeof(drh->d_clen)), *options); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+        if (res == 0) {
+          const auto iter = options->find(EDNSOptionCode::ECS);
+          if (iter != options->end() && !iter->second.values.empty() && iter->second.values.at(0).content != nullptr && iter->second.values.at(0).size > 0) {
+            EDNSSubnetOpts eso;
+            if (EDNSSubnetOpts::getFromString(iter->second.values.at(0).content, iter->second.values.at(0).size, &eso)) {
+              *ednssubnet = eso;
+              foundECS = true;
+            }
+          }
+        }
+      }
+    }
+
+    pos += ntohs(drh->d_clen);
+  }
+}
+
+bool checkForCacheHit(bool qnameParsed, unsigned int tag, const string& data,
+                      DNSName& qname, uint16_t& qtype, uint16_t& qclass,
+                      const struct timeval& now,
+                      string& response, uint32_t& qhash,
+                      RecursorPacketCache::OptPBData& pbData, bool tcp, const ComboAddress& source, const ComboAddress& mappedSource)
+{
+  if (!g_packetCache) {
+    return false;
+  }
+  bool cacheHit = false;
+  uint32_t age = 0;
+  vState valState = vState::Indeterminate;
+
+  if (qnameParsed) {
+    cacheHit = g_packetCache->getResponsePacket(tag, data, qname, qtype, qclass, now.tv_sec, &response, &age, &valState, &qhash, &pbData, tcp);
+  }
+  else {
+    cacheHit = g_packetCache->getResponsePacket(tag, data, qname, &qtype, &qclass, now.tv_sec, &response, &age, &valState, &qhash, &pbData, tcp);
+  }
+
+  if (cacheHit) {
+    if (vStateIsBogus(valState)) {
+      if (t_bogusremotes) {
+        t_bogusremotes->push_back(source);
+      }
+      if (t_bogusqueryring) {
+        t_bogusqueryring->push_back({qname, qtype});
+      }
+    }
+
+    // This is only to get the proxyMapping suffixMatch stats right i the case of a PC hit
+    if (t_proxyMapping && source != mappedSource) {
+      if (const auto* found = t_proxyMapping->lookup(source)) {
+        if (found->second.suffixMatchNode) {
+          if (found->second.suffixMatchNode->check(qname)) {
+            ++found->second.stats.suffixMatches;
+          }
+        }
+      }
+    }
+
+    // DNS header is always 12 bytes in wire format, regardless of struct packing
+#ifdef _WIN32
+    constexpr size_t DNS_HEADER_SIZE = 12;
+    if (response.length() >= DNS_HEADER_SIZE) {
+      // WINDOWS FIX: dnsheader_aligned copies 14 bytes on Windows, causing misalignment
+      // Use manual parsing similar to handleUDPServerResponse
+      dnsheader dnsheader{};
+      const uint8_t* raw = reinterpret_cast<const uint8_t*>(response.data());
+      memset(&dnsheader, 0, sizeof(dnsheader));
+      memcpy(reinterpret_cast<uint8_t*>(&dnsheader) + 2, raw + 2, 2);  // Copy Flags
+      uint16_t id_raw = (static_cast<uint16_t>(raw[0]) << 8) | static_cast<uint16_t>(raw[1]);
+      dnsheader.id = ntohs(id_raw);
+      uint16_t qdcount_raw = (static_cast<uint16_t>(raw[4]) << 8) | static_cast<uint16_t>(raw[5]);
+      uint16_t ancount_raw = (static_cast<uint16_t>(raw[6]) << 8) | static_cast<uint16_t>(raw[7]);
+      uint16_t nscount_raw = (static_cast<uint16_t>(raw[8]) << 8) | static_cast<uint16_t>(raw[9]);
+      uint16_t arcount_raw = (static_cast<uint16_t>(raw[10]) << 8) | static_cast<uint16_t>(raw[11]);
+      dnsheader.qdcount = qdcount_raw;
+      dnsheader.ancount = ancount_raw;
+      dnsheader.nscount = nscount_raw;
+      dnsheader.arcount = arcount_raw;
+      // ageDNSPacket needs dnsheader_aligned, so create a temporary aligned struct
+      dnsheader_aligned dh_aligned(&dnsheader);
+      ageDNSPacket(response, age, dh_aligned);
+      updateResponseStats(dnsheader.rcode, source, response.length(), nullptr, 0);
+      t_Counters.at(rec::ResponseStats::responseStats).submitResponse(qtype, response.length(), dnsheader.rcode);
+    }
+#else
+    if (response.length() >= sizeof(struct dnsheader)) {
+      dnsheader_aligned dh_aligned(response.data());
+      ageDNSPacket(response, age, dh_aligned);
+      const auto* dhp = dh_aligned.get();
+      updateResponseStats(dhp->rcode, source, response.length(), nullptr, 0);
+      t_Counters.at(rec::ResponseStats::responseStats).submitResponse(qtype, response.length(), dhp->rcode);
+    }
+#endif
+
+    // we assume 0 usec
+    t_Counters.at(rec::DoubleWAvgCounter::avgLatencyUsec).addToRollingAvg(0.0, g_latencyStatSize);
+    t_Counters.at(rec::DoubleWAvgCounter::avgLatencyOursUsec).addToRollingAvg(0.0, g_latencyStatSize);
+#if 0
+    // XXX changes behaviour compared to old code!
+    t_Counters.at(rec::Counter::answers)(0);
+    t_Counters.at(rec::Counter::ourtime)(0);
+#endif
+  }
+
+  return cacheHit;
+}
+
+static void* pleaseWipeCaches(const DNSName& canon, bool subtree, uint16_t qtype)
+{
+  auto res = wipeCaches(canon, subtree, qtype);
+  SLOG(g_log << Logger::Info << "Wiped caches for " << canon << ": " << res.record_count << " records; " << res.negative_record_count << " negative records; " << res.packet_count << " packets" << endl,
+       g_slog->withName("runtime")->info(Logr::Info, "Wiped cache", "qname", Logging::Loggable(canon), "records", Logging::Loggable(res.record_count), "negrecords", Logging::Loggable(res.negative_record_count), "packets", Logging::Loggable(res.packet_count)));
+  return nullptr;
+}
+
+void requestWipeCaches(const DNSName& canon)
+{
+  // Stub: In minimal setup, cache wiping is disabled
+  (void)canon;
+}
+
+bool expectProxyProtocol(const ComboAddress& from, const ComboAddress& listenAddress)
+{
+  if (!t_proxyProtocolACL) {
+    return false;
+  }
+  if (t_proxyProtocolACL->match(from)) {
+    if (!t_proxyProtocolExceptions) {
+      return true;
+    }
+    return t_proxyProtocolExceptions->count(listenAddress) == 0;
+  }
+  return false;
+}
+
+ssize_t parseProxyHeader(const std::string& /* data */, bool& /* proxyProto */, ComboAddress& /* source */, ComboAddress& /* destination */, bool& /* tcp */, std::vector<ProxyProtocolValue>& /* proxyProtocolValues */)
+{
+  // Stub: Proxy protocol parsing disabled in minimal setup
+  return 0;
+}
+
+// ========================================================================
+// UDP FLOW: doProcessUDPQuestion - process incoming UDP query (ENABLED)
+// ========================================================================
+// This function is ENABLED and must be compiled (moved outside #if 0 block)
 // fromaddr: the address the query is coming from
 // destaddr: the address the query was received on
 // source: the address we assume the query is coming from, might be set by proxy protocol
@@ -3082,8 +3351,59 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
   }
 
   string response;
+  const dnsheader* dnsheader_ptr;
+#ifdef _WIN32
+  // ========================================================================
+  // WINDOWS FIX: DNS Header Padding and Byte Order Issues
+  // ========================================================================
+  // PROBLEM: On Windows (MinGW), sizeof(dnsheader) = 14 bytes due to struct padding,
+  //          but DNS wire format header is always 12 bytes. The padding (2 bytes) is
+  //          inserted after the Flags field (bytes 2-3), causing misalignment when
+  //          using memcpy() or dnsheader_aligned.
+  //
+  // STRUCT LAYOUT (Windows, 14 bytes):
+  //   [ID:2][Flags:2][PADDING:2][QDCOUNT:2][ANCOUNT:2][NSCOUNT:2][ARCOUNT:2]
+  // WIRE FORMAT (always 12 bytes):
+  //   [ID:2][Flags:2][QDCOUNT:2][ANCOUNT:2][NSCOUNT:2][ARCOUNT:2]
+  //
+  // WHY THIS FIX IS NEEDED:
+  //   1. dnsheader_aligned uses memcpy(&d_h, mem, sizeof(dnsheader)) which copies 14 bytes
+  //      from a 12-byte wire format, causing count fields to be misaligned.
+  //   2. When memcpy copies 14 bytes, bytes 4-5 of the wire (QDCOUNT) end up in struct
+  //      bytes 6-7 (where ANCOUNT should be), causing qdcount=256 errors.
+  //
+  // SOLUTION: Read ID and count fields directly from raw wire format bytes, manually
+  //           construct uint16_t values. Flags are read from struct after copying bytes 2-3.
+  //
+  // CRITICAL: DO NOT REMOVE THIS FIX - it is essential for correct DNS packet parsing
+  //           on Windows. Without it, query validation will fail.
+  // ========================================================================
+  static dnsheader dnsheader_storage; // Use static to keep it in scope
+  dnsheader_storage = dnsheader{};
+  const uint8_t* raw = reinterpret_cast<const uint8_t*>(question.data());
+  // Initialize struct to zero first
+  memset(&dnsheader_storage, 0, sizeof(dnsheader_storage));
+  // Copy only Flags (bytes 2-3) to struct, skip ID (we'll read it manually)
+  memcpy(reinterpret_cast<uint8_t*>(&dnsheader_storage) + 2, raw + 2, 2);
+  // Read ID directly from raw bytes (network byte order) and construct uint16_t manually
+  uint16_t id_raw = (static_cast<uint16_t>(raw[0]) << 8) | static_cast<uint16_t>(raw[1]);
+  dnsheader_storage.id = ntohs(id_raw);  // Convert from network byte order to host byte order
+  // Read count fields directly from raw bytes (network byte order) and construct uint16_t manually
+  uint16_t qdcount_raw = (static_cast<uint16_t>(raw[4]) << 8) | static_cast<uint16_t>(raw[5]);
+  uint16_t ancount_raw = (static_cast<uint16_t>(raw[6]) << 8) | static_cast<uint16_t>(raw[7]);
+  uint16_t nscount_raw = (static_cast<uint16_t>(raw[8]) << 8) | static_cast<uint16_t>(raw[9]);
+  uint16_t arcount_raw = (static_cast<uint16_t>(raw[10]) << 8) | static_cast<uint16_t>(raw[11]);
+  // Assign to struct fields - these values are already correct (constructed from network byte order)
+  dnsheader_storage.qdcount = qdcount_raw;
+  dnsheader_storage.ancount = ancount_raw;
+  dnsheader_storage.nscount = nscount_raw;
+  dnsheader_storage.arcount = arcount_raw;
+  dnsheader_ptr = &dnsheader_storage;
+#else
+  // LINUX/UNIX: Use upstream pattern (dnsheader_aligned works because sizeof == 12)
   const dnsheader_aligned headerdata(question.data());
-  const dnsheader* dnsheader = headerdata.get();
+  dnsheader_ptr = headerdata.get();
+#endif
   unsigned int ctag = 0;
   uint32_t qhash = 0;
   bool needEDNSParse = false;
@@ -3099,8 +3419,10 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
   boost::uuids::uuid uniqueId{};
   auto luaconfsLocal = g_luaconfs.getLocal();
   const auto pbExport = checkProtobufExport(luaconfsLocal);
-  const auto outgoingbExport = checkOutgoingProtobufExport(luaconfsLocal);
-  if (pbExport || outgoingbExport) {
+  // const auto outgoingbExport = checkOutgoingProtobufExport(luaconfsLocal);
+  checkOutgoingProtobufExport(luaconfsLocal); // Returns void, just call it
+  if (pbExport) {
+  // if (pbExport || outgoingbExport) {
     if (pbExport) {
       needEDNSParse = true;
     }
@@ -3141,7 +3463,8 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
 #endif
 
     // We do not have a SyncRes specific Lua context at this point yet, so ok to use t_pdl
-    if (needEDNSParse || (t_pdl && (t_pdl->hasGettagFunc() || t_pdl->hasGettagFFIFunc())) || dnsheader->opcode == static_cast<unsigned>(Opcode::Notify)) {
+    // NOTE: Lua functions are disabled in minimal setup, so t_pdl checks are commented out
+    if (needEDNSParse || dnsheader_ptr->opcode == static_cast<unsigned>(Opcode::Notify)) {
       try {
         EDNSOptionViewMap ednsOptions;
 
@@ -3158,40 +3481,41 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
         if (SyncRes::eventTraceEnabled(SyncRes::event_trace_to_ot)) {
           pdns::trace::extractOTraceIDs(ednsOptions, otTrace);
         }
-        if (t_pdl) {
-          try {
-            if (t_pdl->hasGettagFFIFunc()) {
-              RecursorLua4::FFIParams params(qname, qtype, destaddr, fromaddr, destination, source, ednssubnet.getSource(), data, policyTags, records, ednsOptions, proxyProtocolValues, requestorId, deviceId, deviceName, routingTag, rcode, ttlCap, variable, false, logQuery, logResponse, followCNAMEs, extendedErrorCode, extendedErrorExtra, responsePaddingDisabled, meta);
-
-              auto match = eventTrace.add(RecEventTrace::LuaGetTagFFI);
-              ctag = t_pdl->gettag_ffi(params);
-              eventTrace.add(RecEventTrace::LuaGetTagFFI, ctag, false, match);
-            }
-            else if (t_pdl->hasGettagFunc()) {
-              auto match = eventTrace.add(RecEventTrace::LuaGetTag);
-              ctag = t_pdl->gettag(source, ednssubnet.getSource(), destination, qname, qtype, &policyTags, data, ednsOptions, false, requestorId, deviceId, deviceName, routingTag, proxyProtocolValues);
-              eventTrace.add(RecEventTrace::LuaGetTag, ctag, false, match);
-            }
-          }
-          catch (const MOADNSException& moadnsexception) {
-            if (g_logCommonErrors) {
-              g_slogudpin->error(moadnsexception.what(), "Error parsing a query packet for tag determination", "qname", Logging::Loggable(qname), "excepion", Logging::Loggable("MOADNSException"));
-            }
-          }
-          catch (const std::exception& stdException) {
-            g_rateLimitedLogger.log(g_slogudpin, "Error parsing a query packet for tag determination", stdException, "qname", Logging::Loggable(qname), "remote", Logging::Loggable(fromaddr));
-          }
-        }
+        // NOTE: Lua gettag functions are disabled in minimal setup
+        // if (t_pdl) {
+        //   try {
+        //     if (t_pdl->hasGettagFFIFunc()) {
+        //       RecursorLua4::FFIParams params(qname, qtype, destaddr, fromaddr, destination, source, ednssubnet.getSource(), data, policyTags, records, ednsOptions, proxyProtocolValues, requestorId, deviceId, deviceName, routingTag, rcode, ttlCap, variable, false, logQuery, logResponse, followCNAMEs, extendedErrorCode, extendedErrorExtra, responsePaddingDisabled, meta);
+        //       auto match = eventTrace.add(RecEventTrace::LuaGetTagFFI);
+        //       ctag = t_pdl->gettag_ffi(params);
+        //       eventTrace.add(RecEventTrace::LuaGetTagFFI, ctag, false, match);
+        //     }
+        //     else if (t_pdl->hasGettagFunc()) {
+        //       auto match = eventTrace.add(RecEventTrace::LuaGetTag);
+        //       ctag = t_pdl->gettag(source, ednssubnet.getSource(), destination, qname, qtype, &policyTags, data, ednsOptions, false, requestorId, deviceId, deviceName, routingTag, proxyProtocolValues);
+        //       eventTrace.add(RecEventTrace::LuaGetTag, ctag, false, match);
+        //     }
+        //   }
+        //   catch (const MOADNSException& moadnsexception) {
+        //     if (g_logCommonErrors) {
+        //       g_slogudpin->error(moadnsexception.what(), "Error parsing a query packet for tag determination", "qname", Logging::Loggable(qname), "excepion", Logging::Loggable("MOADNSException"));
+        //     }
+        //   }
+        //   catch (const std::exception& stdException) {
+        //     g_rateLimitedLogger.log(g_slogudpin, "Error parsing a query packet for tag determination", stdException, "qname", Logging::Loggable(qname), "remote", Logging::Loggable(fromaddr));
+        //   }
+        // }
       }
       catch (const std::exception& stdException) {
-        g_rateLimitedLogger.log(g_slogudpin, "Error parsing a query packet for tag determination, setting tag=0", stdException);
+        // NOTE: Error handling disabled in minimal setup
+        (void)stdException;
       }
     }
 
     RecursorPacketCache::OptPBData pbData{boost::none};
     if (t_protobufServers.servers) {
       if (logQuery && !(luaconfsLocal->protobufExportConfig.taggedOnly && policyTags.empty())) {
-        protobufLogQuery(luaconfsLocal, uniqueId, source, destination, mappedSource, ednssubnet.getSource(), false, question.size(), qname, qtype, qclass, policyTags, requestorId, deviceId, deviceName, meta, ednsVersion, *dnsheader);
+        protobufLogQuery(luaconfsLocal, uniqueId, source, destination, mappedSource, ednssubnet.getSource(), false, question.size(), qname, qtype, qclass, policyTags, requestorId, deviceId, deviceName, meta, ednsVersion, *dnsheader_ptr);
       }
     }
 
@@ -3199,7 +3523,7 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
       ctag = g_paddingTag;
     }
 
-    if (dnsheader->opcode == static_cast<unsigned>(Opcode::Query)) {
+    if (dnsheader_ptr->opcode == static_cast<unsigned>(Opcode::Query)) {
       /* It might seem like a good idea to skip the packet cache lookup if we know that the answer is not cacheable,
          but it means that the hash would not be computed. If some script decides at a later time to mark back the answer
          as cacheable we would cache it with a wrong tag, so better safe than sorry. */
@@ -3225,9 +3549,10 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
         int sendErr = sendOnNBSocket(fileDesc, &msgh);
         eventTrace.add(RecEventTrace::AnswerSent);
 
-        if (t_protobufServers.servers && logResponse && (!luaconfsLocal->protobufExportConfig.taggedOnly || (pbData && pbData->d_tagged))) {
-          protobufLogResponse(qname, qtype, dnsheader, luaconfsLocal, pbData, tval, false, source, destination, mappedSource, ednssubnet, uniqueId, requestorId, deviceId, deviceName, meta, eventTrace, otTrace, policyTags);
-        }
+        // NOTE: protobufLogResponse is disabled in minimal setup
+        // if (t_protobufServers.servers && logResponse && (!luaconfsLocal->protobufExportConfig.taggedOnly || (pbData && pbData->d_tagged))) {
+        //   protobufLogResponse(qname, qtype, *dnsheader_ptr, luaconfsLocal, pbData, tval, false, source, destination, mappedSource, ednssubnet, uniqueId, requestorId, deviceId, deviceName, meta, eventTrace, otTrace, policyTags);
+        // }
 
         if (eventTrace.enabled() && SyncRes::eventTraceEnabled(SyncRes::event_trace_to_log)) {
           SLOG(g_log << Logger::Info << eventTrace.toString() << endl,
@@ -3257,7 +3582,8 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
   }
 
   if (t_pdl) {
-    bool ipf = t_pdl->ipfilter(source, destination, *dnsheader, eventTrace);
+    // NOTE: Lua ipfilter is disabled in minimal setup
+    bool ipf = false; // t_pdl->ipfilter(source, destination, *dnsheader_ptr, eventTrace);
     if (ipf) {
       if (!g_quiet) {
         SLOG(g_log << Logger::Notice << RecThreadInfo::id() << " [" << g_multiTasker->getTid() << "/" << g_multiTasker->numProcesses() << "] DROPPED question from " << source.toStringWithPort() << (source != fromaddr ? " (via " + fromaddr.toStringWithPort() + ")" : "") << " based on policy" << endl,
@@ -3268,7 +3594,7 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
     }
   }
 
-  if (dnsheader->opcode == static_cast<unsigned>(Opcode::Notify)) {
+  if (dnsheader_ptr->opcode == static_cast<unsigned>(Opcode::Notify)) {
     if (!isAllowNotifyForZone(qname)) {
       if (!g_quiet) {
         SLOG(g_log << Logger::Error << "[" << g_multiTasker->getTid() << "] dropping UDP NOTIFY from " << source.toStringWithPort() << (source != fromaddr ? " (via " + fromaddr.toStringWithPort() + ")" : "") << ", for " << qname.toLogString() << ", zone not matched by allow-notify-for" << endl,
@@ -3345,7 +3671,11 @@ static string* doProcessUDPQuestion(const std::string& question, const ComboAddr
   return nullptr;
 }
 
-static void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& /* var */) // NOLINT(readability-function-cognitive-complexity): https://github.com/PowerDNS/pdns/issues/12791
+// ========================================================================
+// UDP FLOW: handleNewUDPQuestion - entry point for incoming UDP queries (ENABLED)
+// ========================================================================
+// This function is ENABLED and must be compiled (moved outside #if 0 block)
+void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& /* var */) // NOLINT(readability-function-cognitive-complexity): https://github.com/PowerDNS/pdns/issues/12791
 {
   const bool proxyActive = t_proxyProtocolACL && !t_proxyProtocolACL->empty();
   static const size_t maxIncomingQuerySize = !proxyActive ? 512 : (512 + g_proxyProtocolMaximumSize);
@@ -3368,6 +3698,26 @@ static void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& /* va
     fromaddr.sin6.sin6_family = AF_INET6; // this makes sure fromaddr is big enough
     fillMSGHdr(&msgh, &iov, &cbuf, sizeof(cbuf), data.data(), data.size(), &fromaddr);
 
+#ifdef _WIN32
+    // WINDOWS: Use recvfrom instead of recvmsg (control messages not available)
+    socklen_t addrlen = sizeof(fromaddr);
+    ssize_t len = recvfrom(fileDesc, data.data(), data.size(), 0, reinterpret_cast<sockaddr*>(&fromaddr), &addrlen); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+    if (len >= 0) {
+      eventTrace.clear();
+      eventTrace.setEnabled(SyncRes::s_event_trace_enabled != 0);
+      // eventTrace uses monotonic time, while OpenTelemetry uses absolute time. setEnabled()
+      // established the reference point, get an absolute TS as close as possible to the
+      // eventTrace start of trace time.
+      auto traceTS = pdns::trace::timestamp();
+      eventTrace.add(RecEventTrace::ReqRecv);
+      if (SyncRes::eventTraceEnabled(SyncRes::event_trace_to_ot)) {
+        otTrace.clear();
+        otTrace.start_time_unix_nano = traceTS;
+      }
+      firstQuery = false;
+      // Windows doesn't support MSG_TRUNC, so we can't detect truncated packets
+      // This is acceptable for minimal setup
+#else
     if (ssize_t len = recvmsg(fileDesc, &msgh, 0); len >= 0) {
       eventTrace.clear();
       eventTrace.setEnabled(SyncRes::s_event_trace_enabled != 0);
@@ -3390,6 +3740,7 @@ static void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& /* va
         }
         return;
       }
+#endif // _WIN32
 
       data.resize(static_cast<size_t>(len));
 
@@ -3446,7 +3797,13 @@ static void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& /* va
         return;
       }
 
+      // DNS header is always 12 bytes in wire format, regardless of struct packing
+#ifdef _WIN32
+      constexpr size_t DNS_HEADER_SIZE = 12;
+      if (data.size() < DNS_HEADER_SIZE) {
+#else
       if (data.size() < sizeof(dnsheader)) {
+#endif
         t_Counters.at(rec::Counter::ignoredCount)++;
         if (!g_quiet) {
           SLOG(g_log << Logger::Error << "Ignoring too-short (" << std::to_string(data.size()) << ") query from " << fromaddr.toString() << endl,
@@ -3492,24 +3849,75 @@ static void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& /* va
       }
 
       try {
+        const dnsheader* dnsheader_ptr;
+#ifdef _WIN32
+        // ========================================================================
+        // WINDOWS FIX: DNS Header Padding and Byte Order Issues
+        // ========================================================================
+        // PROBLEM: On Windows (MinGW), sizeof(dnsheader) = 14 bytes due to struct padding,
+        //          but DNS wire format header is always 12 bytes. The padding (2 bytes) is
+        //          inserted after the Flags field (bytes 2-3), causing misalignment when
+        //          using memcpy() or dnsheader_aligned.
+        //
+        // STRUCT LAYOUT (Windows, 14 bytes):
+        //   [ID:2][Flags:2][PADDING:2][QDCOUNT:2][ANCOUNT:2][NSCOUNT:2][ARCOUNT:2]
+        // WIRE FORMAT (always 12 bytes):
+        //   [ID:2][Flags:2][QDCOUNT:2][ANCOUNT:2][NSCOUNT:2][ARCOUNT:2]
+        //
+        // WHY THIS FIX IS NEEDED:
+        //   1. dnsheader_aligned uses memcpy(&d_h, mem, sizeof(dnsheader)) which copies 14 bytes
+        //      from a 12-byte wire format, causing count fields to be misaligned.
+        //   2. When memcpy copies 14 bytes, bytes 4-5 of the wire (QDCOUNT) end up in struct
+        //      bytes 6-7 (where ANCOUNT should be), causing qdcount=256 errors.
+        //
+        // SOLUTION: Read ID and count fields directly from raw wire format bytes, manually
+        //           construct uint16_t values. Flags are read from struct after copying bytes 2-3.
+        //
+        // CRITICAL: DO NOT REMOVE THIS FIX - it is essential for correct DNS packet parsing
+        //           on Windows. Without it, query validation will fail.
+        // ========================================================================
+        static dnsheader dnsheader_storage; // Use static to keep it in scope
+        dnsheader_storage = dnsheader{};
+        const uint8_t* raw = reinterpret_cast<const uint8_t*>(data.data());
+        // Initialize struct to zero first
+        memset(&dnsheader_storage, 0, sizeof(dnsheader_storage));
+        // Copy only Flags (bytes 2-3) to struct, skip ID (we'll read it manually)
+        memcpy(reinterpret_cast<uint8_t*>(&dnsheader_storage) + 2, raw + 2, 2);
+        // Read ID directly from raw bytes (network byte order) and construct uint16_t manually
+        uint16_t id_raw = (static_cast<uint16_t>(raw[0]) << 8) | static_cast<uint16_t>(raw[1]);
+        dnsheader_storage.id = ntohs(id_raw);  // Convert from network byte order to host byte order
+        // Read count fields directly from raw bytes (network byte order) and construct uint16_t manually
+        uint16_t qdcount_raw = (static_cast<uint16_t>(raw[4]) << 8) | static_cast<uint16_t>(raw[5]);
+        uint16_t ancount_raw = (static_cast<uint16_t>(raw[6]) << 8) | static_cast<uint16_t>(raw[7]);
+        uint16_t nscount_raw = (static_cast<uint16_t>(raw[8]) << 8) | static_cast<uint16_t>(raw[9]);
+        uint16_t arcount_raw = (static_cast<uint16_t>(raw[10]) << 8) | static_cast<uint16_t>(raw[11]);
+        // Assign to struct fields - these values are already correct (constructed from network byte order)
+        dnsheader_storage.qdcount = qdcount_raw;
+        dnsheader_storage.ancount = ancount_raw;
+        dnsheader_storage.nscount = nscount_raw;
+        dnsheader_storage.arcount = arcount_raw;
+        dnsheader_ptr = &dnsheader_storage;
+#else
+        // LINUX/UNIX: Use upstream pattern (dnsheader_aligned works because sizeof == 12)
         const dnsheader_aligned headerdata(data.data());
-        const dnsheader* dnsheader = headerdata.get();
+        dnsheader_ptr = headerdata.get();
+#endif
 
-        if (dnsheader->qr) {
+        if (dnsheader_ptr->qr) {
           t_Counters.at(rec::Counter::ignoredCount)++;
           if (g_logCommonErrors) {
             SLOG(g_log << Logger::Error << "Ignoring answer from " << fromaddr.toString() << " on server socket!" << endl,
                  g_slogudpin->info(Logr::Error, "Ignoring answer on server socket", "remote", Logging::Loggable(fromaddr)));
           }
         }
-        else if (dnsheader->opcode != static_cast<unsigned>(Opcode::Query) && dnsheader->opcode != static_cast<unsigned>(Opcode::Notify)) {
+        else if (dnsheader_ptr->opcode != static_cast<unsigned>(Opcode::Query) && dnsheader_ptr->opcode != static_cast<unsigned>(Opcode::Notify)) {
           t_Counters.at(rec::Counter::ignoredCount)++;
           if (g_logCommonErrors) {
-            SLOG(g_log << Logger::Error << "Ignoring unsupported opcode " << Opcode::to_s(dnsheader->opcode) << " from " << fromaddr.toString() << " on server socket!" << endl,
-                 g_slogudpin->info(Logr::Error, "Ignoring unsupported opcode server socket", "remote", Logging::Loggable(fromaddr), "opcode", Logging::Loggable(Opcode::to_s(dnsheader->opcode))));
+            SLOG(g_log << Logger::Error << "Ignoring unsupported opcode " << Opcode::to_s(dnsheader_ptr->opcode) << " from " << fromaddr.toString() << " on server socket!" << endl,
+                 g_slogudpin->info(Logr::Error, "Ignoring unsupported opcode server socket", "remote", Logging::Loggable(fromaddr), "opcode", Logging::Loggable(Opcode::to_s(dnsheader_ptr->opcode))));
           }
         }
-        else if (dnsheader->qdcount == 0U) {
+        else if (dnsheader_ptr->qdcount == 0U) {
           t_Counters.at(rec::Counter::emptyQueriesCount)++;
           if (g_logCommonErrors) {
             SLOG(g_log << Logger::Error << "Ignoring empty (qdcount == 0) query from " << fromaddr.toString() << " on server socket!" << endl,
@@ -3517,7 +3925,7 @@ static void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& /* va
           }
         }
         else {
-          if (dnsheader->opcode == static_cast<unsigned>(Opcode::Notify)) {
+          if (dnsheader_ptr->opcode == static_cast<unsigned>(Opcode::Notify)) {
             if (!t_allowNotifyFrom || !t_allowNotifyFrom->match(&mappedSource)) {
               if (!g_quiet) {
                 SLOG(g_log << Logger::Error << "[" << g_multiTasker->getTid() << "] dropping UDP NOTIFY from " << mappedSource.toString() << ", address not matched by allow-notify-from" << endl,
@@ -3562,6 +3970,15 @@ static void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& /* va
         }
       }
     }
+#ifdef _WIN32
+    else {
+      // Windows: recvfrom error handling
+      if (firstQuery && WSAGetLastError() == WSAEWOULDBLOCK) {
+        t_Counters.at(rec::Counter::noPacketError)++;
+      }
+      break;
+    }
+#else
     else {
       if (firstQuery && errno == EAGAIN) {
         t_Counters.at(rec::Counter::noPacketError)++;
@@ -3569,10 +3986,13 @@ static void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& /* va
 
       break;
     }
+#endif // _WIN32
   }
   t_Counters.updateSnap(g_regressionTestMode);
 }
 
+#if 0
+// Rest of disabled code continues below (doProcessUDPQuestion and handleNewUDPQuestion are now enabled above)
 // The two last arguments to makeUDPServerSockets are used for logging purposes only
 unsigned int makeUDPServerSockets(deferredAdd_t& deferredAdds, Logr::log_t log, bool doLog, unsigned int instances)
 {

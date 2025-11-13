@@ -385,6 +385,28 @@ void fillMSGHdr(struct msghdr* msgh, struct iovec* iov, cmsgbuf_aligned* cbuf, s
   msgh->msg_iovlen = 1;
   msgh->msg_flags = 0;
 }
+
+// ========================================================================
+// WINDOWS STUBS: HarvestDestinationAddress and HarvestTimestamp
+// ========================================================================
+// On Windows, control messages (IP_PKTINFO, IPV6_PKTINFO, SO_TIMESTAMP) are
+// not available via recvmsg(), so these functions always return false.
+// The calling code handles this gracefully by falling back to alternative
+// methods (rplookup(), getsockname(), gettimeofday()).
+// ========================================================================
+
+bool HarvestDestinationAddress(const struct msghdr* msgh, ComboAddress* destination)
+{
+  // Windows: Control messages not available via recvmsg()
+  // Always return false to trigger fallback to rplookup()/getsockname()
+  (void)msgh;  // Unused parameter
+  (void)destination;  // Unused parameter
+  return false;
+}
+
+// Note: HarvestTimestamp() is already compatible with Windows
+// It's not wrapped in #ifndef _WIN32 and returns false if SO_TIMESTAMP
+// is not available, which is the correct behavior for Windows.
 #endif // _WIN32
 
 // be careful: when using this for receive purposes, make sure addr->sin4.sin_family is set appropriately so getSocklen works!

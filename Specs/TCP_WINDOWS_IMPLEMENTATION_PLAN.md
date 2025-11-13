@@ -440,7 +440,7 @@ if (forceTCP || (spoofed || (gotAnswer && truncated))) {
 6. **Validate**: Full TCP query/response cycle
 
 ---
-
+    
 ## Notes
 
 - Most socket operations are already Windows-compatible
