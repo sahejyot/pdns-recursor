@@ -2735,6 +2735,18 @@ bool SyncRes::doCNAMECacheCheck(const DNSName& qname, const QType qtype, vector<
       DNSRecord dnsRecord = record;
       auto alreadyPresent = false;
 
+      // ========================================================================
+      // TTL CHECK: Log TTD value from cache before conversion
+      // ========================================================================
+      uint32_t ttd_from_cache = dnsRecord.d_ttl;  // This is TTD (absolute time) from cache
+      uint32_t now_sec = static_cast<uint32_t>(d_now.tv_sec);
+      std::cout << "[TTL_CHECK cache hit] Record: name=" << dnsRecord.d_name 
+                << " type=" << dnsRecord.d_type 
+                << " ttd=" << ttd_from_cache 
+                << " now=" << now_sec
+                << " (ttd - now = " << (ttd_from_cache > now_sec ? (ttd_from_cache - now_sec) : 0) << ")" << std::endl;
+      // ========================================================================
+
       if (checkForDups) {
         // This can happen on the 2nd iteration of the servestale loop, where the first iteration
         // added a C/DNAME record, but the target resolve failed
@@ -2748,6 +2760,12 @@ bool SyncRes::doCNAMECacheCheck(const DNSName& qname, const QType qtype, vector<
       dnsRecord.d_ttl -= d_now.tv_sec;
       dnsRecord.d_ttl = std::min(dnsRecord.d_ttl, capTTL);
       const uint32_t ttl = dnsRecord.d_ttl;
+      
+      // ========================================================================
+      // TTL CHECK: Log TTL after conversion
+      // ========================================================================
+      std::cout << "[TTL_CHECK cache hit] After conversion: ttl=" << ttl << std::endl;
+      // ========================================================================
       if (!alreadyPresent) {
         ret.reserve(ret.size() + 2 + signatures->size() + authorityRecs->size());
         ret.push_back(dnsRecord);
@@ -3170,6 +3188,24 @@ bool SyncRes::doCacheCheck(const DNSName& qname, const DNSName& authname, bool w
         continue;
       }
 
+      // ========================================================================
+      // TTL CHECK: Log TTD value before conversion
+      // ========================================================================
+      uint32_t ttd_value = j->d_ttl;  // This is actually TTD (absolute time) from cache
+      uint32_t now_sec = static_cast<uint32_t>(d_now.tv_sec);
+      bool is_expired = (ttd_value <= now_sec);
+      uint32_t calculated_ttl = (ttd_value > now_sec) ? (ttd_value - now_sec) : 0;
+      std::cout << "[TTL_CHECK doCacheCheck] Record: name=" << j->d_name 
+                << " type=" << j->d_type 
+                << " ttd=" << ttd_value 
+                << " now=" << now_sec
+                << " calculated_ttl=" << calculated_ttl;
+      if (is_expired) {
+        std::cout << " [EXPIRED - skipping]";
+      }
+      std::cout << std::endl;
+      // ========================================================================
+      
       if (j->d_ttl > (unsigned int)d_now.tv_sec) {
         DNSRecord dnsRecord = *j;
         dnsRecord.d_ttl -= d_now.tv_sec;
@@ -4672,7 +4708,25 @@ RCode::rcodes_ SyncRes::updateCacheFromRecords(unsigned int depth, const string&
   fixupAnswer(prefix, lwr, qname, qtype, auth, wasForwarded, rdQuery);
   sanitizeRecords(prefix, lwr, qname, qtype, auth, wasForwarded, rdQuery);
 
+  // ========================================================================
+  // TTL CHECK: Log ALL records after sanitizeRecords
+  // ========================================================================
+  std::cout << "[TTL_CHECK after sanitizeRecords] Total records: " << lwr.d_records.size() << std::endl;
+  for (size_t i = 0; i < lwr.d_records.size(); ++i) {
+    const auto& rec = lwr.d_records[i];
+    std::cout << "[TTL_CHECK after sanitizeRecords] Record[" << i << "]: name=" << rec.d_name 
+              << " type=" << rec.d_type 
+              << " place=" << static_cast<int>(rec.d_place)
+              << " ttl=" << rec.d_ttl;
+    if (rec.d_name == qname && rec.d_type == qtype.getCode()) {
+      std::cout << " [MATCHES QUERY]";
+    }
+    std::cout << std::endl;
+  }
+  // ========================================================================
+
   MemRecursorCache::AuthRecsVec authorityRecs;
+  std::cout << "[TTL_CHECK] After creating authorityRecs, before wildcard processing" << std::endl;
   bool isCNAMEAnswer = false;
   bool isDNAMEAnswer = false;
   DNSName seenAuth;
@@ -4790,17 +4844,55 @@ RCode::rcodes_ SyncRes::updateCacheFromRecords(unsigned int depth, const string&
   }
 
   // reap all answers from this packet that are acceptable
+  // ========================================================================
+  // TTL CHECK: Log ALL records at start of updateCacheFromRecords loop
+  // ========================================================================
+  std::cout << "[TTL_CHECK updateCacheFromRecords] START LOOP - Total records: " << lwr.d_records.size() << std::endl;
+  for (size_t i = 0; i < lwr.d_records.size(); ++i) {
+    const auto& rec = lwr.d_records[i];
+    std::cout << "[TTL_CHECK updateCacheFromRecords] Record[" << i << "] BEFORE loop: name=" << rec.d_name 
+              << " type=" << rec.d_type 
+              << " place=" << static_cast<int>(rec.d_place)
+              << " ttl=" << rec.d_ttl;
+    if (rec.d_name == qname && rec.d_type == qtype.getCode()) {
+      std::cout << " [MATCHES QUERY]";
+    }
+    std::cout << std::endl;
+  }
+  // ========================================================================
+  
+  std::cout << "[DEBUG] updateCacheFromRecords: Starting loop over " << lwr.d_records.size() << " records" << std::endl;
+  size_t recordIndex = 0;
   for (auto& rec : lwr.d_records) {
+    std::cout << "[DEBUG] updateCacheFromRecords: Processing record[" << recordIndex << "] name=" << rec.d_name << " type=" << rec.d_type << " place=" << (int)rec.d_place << std::endl;
+    recordIndex++;
+    
     if (rec.d_type == QType::OPT) {
       LOG(prefix << qname << ": OPT answer '" << rec.d_name << "' from '" << auth << "' nameservers" << endl);
       continue;
     }
 
-    LOG(prefix << qname << ": Accept answer '" << rec.d_name << "|" << DNSRecordContent::NumberToType(rec.d_type) << "|" << rec.getContent()->getZoneRepresentation() << "' from '" << auth << "' nameservers? ttl=" << rec.d_ttl << ", place=" << (int)rec.d_place << " ");
+    std::cout << "[DEBUG] updateCacheFromRecords: About to call getContent() for record[" << (recordIndex-1) << "]" << std::endl;
+    try {
+      auto content = rec.getContent();
+      std::cout << "[DEBUG] updateCacheFromRecords: getContent() succeeded, about to call getZoneRepresentation()" << std::endl;
+      std::string zoneRep = content->getZoneRepresentation();
+      std::cout << "[DEBUG] updateCacheFromRecords: getZoneRepresentation() succeeded: " << zoneRep << std::endl;
+      LOG(prefix << qname << ": Accept answer '" << rec.d_name << "|" << DNSRecordContent::NumberToType(rec.d_type) << "|" << zoneRep << "' from '" << auth << "' nameservers? ttl=" << rec.d_ttl << ", place=" << (int)rec.d_place << " ");
+      std::cout << "[DEBUG] updateCacheFromRecords: LOG() call completed" << std::endl;
+    } catch (const std::exception& e) {
+      std::cout << "[DEBUG] updateCacheFromRecords: Exception in getContent/getZoneRepresentation: " << e.what() << std::endl;
+      LOG(prefix << qname << ": Accept answer '" << rec.d_name << "|" << DNSRecordContent::NumberToType(rec.d_type) << "|(error getting content)" << "' from '" << auth << "' nameservers? ttl=" << rec.d_ttl << ", place=" << (int)rec.d_place << " ");
+    } catch (...) {
+      std::cout << "[DEBUG] updateCacheFromRecords: Unknown exception in getContent/getZoneRepresentation" << std::endl;
+      LOG(prefix << qname << ": Accept answer '" << rec.d_name << "|" << DNSRecordContent::NumberToType(rec.d_type) << "|(error getting content)" << "' from '" << auth << "' nameservers? ttl=" << rec.d_ttl << ", place=" << (int)rec.d_place << " ");
+    }
 
     // We called sanitizeRecords before, so all ANY, non-IN and non-aa/non-forwardrecurse answer records are already removed
 
+    std::cout << "[DEBUG] updateCacheFromRecords: After LOG(), checking if rec.d_name.isPartOf(auth) - rec.d_name=" << rec.d_name << " auth=" << auth << std::endl;
     if (rec.d_name.isPartOf(auth)) {
+      std::cout << "[DEBUG] updateCacheFromRecords: rec.d_name.isPartOf(auth) is TRUE" << std::endl;
       if (rec.d_type == QType::RRSIG) {
         LOG("RRSIG - separate" << endl);
       }
@@ -4843,11 +4935,30 @@ RCode::rcodes_ SyncRes::updateCacheFromRecords(unsigned int depth, const string&
 
         rec.d_ttl = min(s_maxcachettl, rec.d_ttl);
 
+        // ========================================================================
+        // TTL CHECK: Log TTL value after min() but before converting to TTD
+        // ========================================================================
+        if (rec.d_name == qname && rec.d_type == qtype.getCode()) {
+          std::cout << "[TTL_CHECK updateCacheFromRecords] AFTER min(s_maxcachettl): name=" << rec.d_name 
+                    << " type=" << rec.d_type 
+                    << " ttl=" << rec.d_ttl << std::endl;
+        }
+        // ========================================================================
+
         DNSRecord dnsRecord(rec);
         tcache[{rec.d_name, rec.d_type, rec.d_place}].d_ttl_time = d_now.tv_sec;
-        dnsRecord.d_ttl += d_now.tv_sec;
+        dnsRecord.d_ttl += d_now.tv_sec;  // Convert TTL to TTD for cache storage
         dnsRecord.d_place = DNSResourceRecord::ANSWER;
         tcache[{rec.d_name, rec.d_type, rec.d_place}].records.push_back(std::move(dnsRecord));
+        
+        // ========================================================================
+        // TTL CHECK: Verify original rec.d_ttl is NOT modified (should still be TTL, not TTD)
+        // ========================================================================
+        if (rec.d_name == qname && rec.d_type == qtype.getCode()) {
+          std::cout << "[TTL_CHECK updateCacheFromRecords] AFTER cache storage: rec.d_ttl=" << rec.d_ttl 
+                    << " (should still be TTL, not TTD)" << std::endl;
+        }
+        // ========================================================================
       }
     }
     else
@@ -5129,6 +5240,7 @@ RCode::rcodes_ SyncRes::updateCacheFromRecords(unsigned int depth, const string&
     }
   }
 
+  std::cout << "[DEBUG] updateCacheFromRecords: Loop completed, about to return RCode::NoError" << std::endl;
   return RCode::NoError;
 }
 
@@ -5370,6 +5482,21 @@ bool SyncRes::processRecords(const std::string& prefix, const DNSName& qname, co
     else if (rec.d_place == DNSResourceRecord::ANSWER && rec.d_name == qname && (rec.d_type == qtype.getCode() || ((lwr.d_aabit || sendRDQuery) && qtype == QType::ANY))) {
       LOG(prefix << qname << ": Answer is in: resolved to '" << rec.getContent()->getZoneRepresentation() << "|" << DNSRecordContent::NumberToType(rec.d_type) << "'" << endl);
       std::cout << "[DEBUG] processRecords: ANSWER FOUND - qname=" << qname << " rec.d_name=" << rec.d_name << " rec.d_type=" << rec.d_type << " qtype=" << qtype.getCode() << " content=" << rec.getContent()->getZoneRepresentation() << std::endl;
+
+      // ========================================================================
+      // TTL CHECK: Log TTL value when adding ANSWER record to ret
+      // ========================================================================
+      std::cout << "[TTL_CHECK processRecords] Adding ANSWER record to ret: name=" << rec.d_name 
+                << " type=" << rec.d_type 
+                << " ttl=" << rec.d_ttl;
+      if (rec.d_ttl == 0) {
+        std::cout << " [WARNING: TTL IS ZERO!]";
+      }
+      if (rec.d_ttl > 1000000000) {
+        std::cout << " [WARNING: LOOKS LIKE TTD!]";
+      }
+      std::cout << std::endl;
+      // ========================================================================
 
       done = true;
       rcode = RCode::NoError;
@@ -6029,12 +6156,16 @@ bool SyncRes::processAnswer(unsigned int depth, const string& prefix, LWResult& 
   bool needWildcardProof = false;
   bool gatherWildcardProof = false;
   unsigned int wildcardLabelsCount = 0;
+  std::cout << "[DEBUG] processAnswer: BEFORE updateCacheFromRecords for qname=" << qname << " qtype=" << qtype << " auth=" << auth << std::endl;
   *rcode = updateCacheFromRecords(depth, prefix, lwr, qname, qtype, auth, wasForwarded, ednsmask, state, needWildcardProof, gatherWildcardProof, wildcardLabelsCount, sendRDQuery, remoteIP);
+  std::cout << "[DEBUG] processAnswer: AFTER updateCacheFromRecords, rcode=" << *rcode << " (NoError=" << RCode::NoError << ")" << std::endl;
   if (*rcode != RCode::NoError) {
+    std::cout << "[DEBUG] processAnswer: rcode != NoError, returning true (done)" << std::endl;
     return true;
   }
 
   LOG(prefix << qname << ": Determining status after receiving this packet" << endl);
+  std::cout << "[DEBUG] processAnswer: About to call processRecords for qname=" << qname << " qtype=" << qtype << " auth=" << auth << std::endl;
 
   set<DNSName> nsset;
   bool realreferral = false;
@@ -6060,16 +6191,15 @@ bool SyncRes::processAnswer(unsigned int depth, const string& prefix, LWResult& 
       }
     }
   }
+  std::cout << "[DEBUG] processAnswer: Calling processRecords for qname=" << qname << " qtype=" << qtype << " auth=" << auth << " lwr.d_records.size()=" << lwr.d_records.size() << std::endl;
   bool done = processRecords(prefix, qname, qtype, auth, lwr, sendRDQuery, ret, nsset, newtarget, newauth, realreferral, negindic, state, needWildcardProof, gatherWildcardProof, wildcardLabelsCount, *rcode, negIndicHasSignatures, depth);
-  if (qname == DNSName("amazon.com")) {
-    std::cout << "[DEBUG] amazon.com processAnswer: realreferral=" << realreferral << " newauth=" << newauth << " nsset.size=" << nsset.size() << std::endl;
-    if (!nsset.empty()) {
-      for (const auto& nsname : nsset) {
-        std::cout << "[DEBUG] amazon.com processAnswer: nsset member=" << nsname << std::endl;
-      }
+  std::cout << "[DEBUG] processAnswer: AFTER processRecords - done=" << done << " realreferral=" << realreferral << " nsset.size()=" << nsset.size() << " newauth=" << newauth << " newtarget=" << newtarget << std::endl;
+  if (!nsset.empty()) {
+    std::cout << "[DEBUG] processAnswer: nsset contains:" << std::endl;
+    for (const auto& nsname : nsset) {
+      std::cout << "[DEBUG] processAnswer:   - " << nsname << std::endl;
     }
   }
-  std::cout << "[DEBUG] processAnswer: after processRecords, done=" << done << " realreferral=" << realreferral << " nsset.size()=" << nsset.size() << " newauth=" << newauth << std::endl;
 
   // If we both have a CNAME and an answer, let the CNAME take precedence. This *should* not happen
   // (because CNAMEs cannot co-exist with other records), but reality says otherwise. Other

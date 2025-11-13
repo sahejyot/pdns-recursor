@@ -80,6 +80,7 @@ set(PDNS_RECURSOR_SOURCES
     base32.cc
     ednscookies.cc
     ednspadding.cc
+    ednsoptions.cc
     
     # I/O multiplexer
     libeventmplexer.cc
@@ -124,13 +125,29 @@ set(PDNS_RECURSOR_SOURCES
     query-local-address.cc
     rec-tcpout.cc
     version.cc
+    reczones.cc
+    reczones-helpers.cc
+    # Additional required sources for startDoResolve
+    shuffle.cc
+    ednsextendederror.cc
+    rec-eventtrace.cc
+    # validate-recursor.cc  # DISABLED: Has dependencies we don't have - g_dnssecLogBogus is defined in dnssec_stubs.cc
 )
 
 # Enable upstream UDP client pieces from pdns_recursor (required for UDP resolution)
-option(ENABLE_WINDOWS_POC_PARTS "Enable minimal upstream UDP parts (asendto/arecvfrom, UDPClientSocks)" ON)
-if(ENABLE_WINDOWS_POC_PARTS)
-    list(APPEND PDNS_RECURSOR_SOURCES pdns_recursor_poc_parts.cc)
-endif()
+# NOTE: pdns_recursor_poc_parts.cc is DISABLED - functions are now in pdns_recursor.cc with Windows fixes
+# The option is kept for reference but the file is not included in the build
+option(ENABLE_WINDOWS_POC_PARTS "Enable minimal upstream UDP parts (asendto/arecvfrom, UDPClientSocks)" OFF)
+# if(ENABLE_WINDOWS_POC_PARTS)
+#     list(APPEND PDNS_RECURSOR_SOURCES pdns_recursor_poc_parts.cc)
+# endif()
+
+# Enable full upstream pdns_recursor.cc (Windows fixes will be added as needed)
+# NOTE: This will cause duplicate symbol errors for asendto/arecvfrom/handleUDPServerResponse
+# We need to either:
+# 1. Remove pdns_recursor_poc_parts.cc and add Windows fixes to pdns_recursor.cc, OR
+# 2. Comment out the duplicate functions in pdns_recursor.cc
+list(APPEND PDNS_RECURSOR_SOURCES pdns_recursor.cc)
 
 # Main executable - POC
 add_executable(pdns_recursor_poc2 main_test.cc ${PDNS_RECURSOR_SOURCES})

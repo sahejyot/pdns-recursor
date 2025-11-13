@@ -58,11 +58,7 @@ bool isSupportedDS(const DSRecordContent&, const std::optional<LogVariant>&)
   return false;
 }
 
-namespace pdns {
-void dedupRecords(std::vector<DNSRecord>&)
-{
-}
-}
+// dedupRecords is now defined in shuffle.cc - removed from here to avoid duplicate definition
 
 // Additional DNSSEC validation stubs
 vState validateWithKeySet(time_t /* now */, const DNSName& /* name */,
@@ -86,5 +82,9 @@ bool isWildcardExpandedOntoItself(const DNSName& /* name */, unsigned int /* lab
   return false;
 }
 #endif
+
+// Define g_dnssecLogBogus (needed by startDoResolve in pdns_recursor.cc)
+// This is normally defined in validate-recursor.cc, but that file has dependencies we don't have
+bool g_dnssecLogBogus = false;  // DNSSEC logging disabled
 
 

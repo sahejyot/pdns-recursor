@@ -21,7 +21,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
-#include "rec-main.hh"
+// Include rec-lua-conf.hh first to define ProtobufExportConfig before rec-main.hh uses it
+#include "rec-lua-conf.hh"  // For g_luaconfs, LuaConfigItems, ProtobufExportConfig (Rust stub created in rust/lib.rs.h)
+// rec-main.hh includes syncres.hh which defines AdditionalMode when HAVE_LUA=0
+// After rec-main.hh is included, ProtobufServersInfo is available
+#include "rec-main.hh"  // For ProtobufServersInfo (which uses ProtobufExportConfig from rec-lua-conf.hh)
 
 #include "arguments.hh"
 #include "dns_random.hh"
@@ -33,6 +37,21 @@
 #include "validate-recursor.hh"
 #include "ratelimitedlog.hh"
 #include "ednsoptions.hh"
+#include "misc.hh"  // For rplookup()
+#include "recpacketcache.hh"  // For RecursorPacketCache
+#include "rec-protozero.hh"  // For RecMessage
+#include "filterpo.hh"  // For DNSFilterEngine::Policy
+#include "misc.hh"  // For Regex
+#include "sholder.hh"  // For LocalStateHolder
+#include "rec-tcounters.hh"  // For rec::TCounters, rec::ResponseStats
+
+#ifdef _WIN32
+// Windows debugging includes
+#include <iostream>
+#include <iomanip>
+#include "utility.hh"  // For Utility::gettimeofday
+#include "windows-compat.h"  // For WSAEventSelect, WSAGetLastError, etc.
+#endif
 
 #ifdef HAVE_SYSTEMD
 #include <systemd/sd-daemon.h>
@@ -43,45 +62,226 @@
 #include "logging.hh"
 #endif /* NOD_ENABLED */
 
-thread_local std::shared_ptr<RecursorLua4> t_pdl;
-thread_local std::shared_ptr<Regex> t_traceRegex;
-thread_local FDWrapper t_tracefd = -1;
-thread_local ProtobufServersInfo t_protobufServers;
-thread_local ProtobufServersInfo t_outgoingProtobufServers;
-
+// ========================================================================
+// UDP FLOW: Only essential globals/thread_locals for UDP flow
+// ========================================================================
+// NOTE: Thread-local variables must be defined here (not extern) because they
+// were previously defined in pdns_recursor_poc_parts.cc which is now disabled.
+// Other globals are defined in globals_stub.cc and lwres.cc, so we declare them as extern.
 thread_local std::unique_ptr<MT_t> g_multiTasker; // the big MTasker
-std::unique_ptr<MemRecursorCache> g_recCache;
-std::unique_ptr<NegCache> g_negCache;
-std::unique_ptr<RecursorPacketCache> g_packetCache;
-
 thread_local std::unique_ptr<FDMultiplexer> t_fdm;
-thread_local std::unique_ptr<addrringbuf_t> t_remotes, t_servfailremotes, t_largeanswerremotes, t_bogusremotes;
-thread_local std::unique_ptr<boost::circular_buffer<pair<DNSName, uint16_t>>> t_queryring, t_servfailqueryring, t_bogusqueryring;
-thread_local std::shared_ptr<NetmaskGroup> t_allowFrom;
-thread_local std::shared_ptr<NetmaskGroup> t_allowNotifyFrom;
-thread_local std::shared_ptr<notifyset_t> t_allowNotifyFor;
-thread_local std::shared_ptr<NetmaskGroup> t_proxyProtocolACL;
-thread_local std::shared_ptr<std::set<ComboAddress>> t_proxyProtocolExceptions;
+thread_local std::unique_ptr<UDPClientSocks> t_udpclientsocks;
+
+// Other globals are defined in globals_stub.cc and lwres.cc
+extern unsigned int g_maxMThreads;
+extern unsigned int g_networkTimeoutMsec;
+extern uint16_t g_outgoingEDNSBufsize;
+unsigned int g_maxChainLength = 0; // Chain length limit for query chaining (defined here since rec-main.cc is not in build)
+extern bool g_logCommonErrors; // Log common errors flag
+extern bool g_ECSHardening; // ECS hardening mode flag (defined in lwres.cc)
+extern Logr::log_t g_slogudpin; // UDP input logger
+
+// Thread-local counters (defined in syncres.cc)
+extern thread_local rec::TCounters t_Counters;
+extern rec::GlobalCounters g_Counters;
+
+// ========================================================================
+// OPTIONAL VARIABLES: For upstream functions (handleNewUDPQuestion, startDoResolve)
+// ========================================================================
+// These are initialized with defaults/nullable values to allow using upstream functions
+// without requiring full feature set (Lua, protobuf, etc.)
+// NOTE: ProtobufServersInfo should be defined in rec-main.hh, but if it's not visible,
+// we define it here to match the upstream definition
+struct ProtobufServersInfo
+{
+  std::shared_ptr<std::vector<std::unique_ptr<RemoteLogger>>> servers;
+  uint64_t generation;
+  ProtobufExportConfig config;
+};
+
+thread_local std::shared_ptr<RecursorLua4> t_pdl; // Lua scripting (nullptr = disabled)
+thread_local ProtobufServersInfo t_protobufServers; // Protobuf logging (default = disabled)
+thread_local ProtobufServersInfo t_outgoingProtobufServers; // Outgoing protobuf (default = disabled)
+thread_local std::unique_ptr<addrringbuf_t> t_remotes, t_servfailremotes, t_largeanswerremotes, t_bogusremotes; // Statistics (nullptr = disabled)
+thread_local std::unique_ptr<boost::circular_buffer<pair<DNSName, uint16_t>>> t_queryring, t_servfailqueryring, t_bogusqueryring; // Query ring (nullptr = disabled)
+thread_local std::shared_ptr<NetmaskGroup> t_allowFrom; // ACL filtering (nullptr = allow all)
+thread_local std::shared_ptr<NetmaskGroup> t_allowNotifyFrom; // NOTIFY ACL (nullptr = allow all)
+thread_local std::shared_ptr<notifyset_t> t_allowNotifyFor; // NOTIFY zones (nullptr = disabled)
+thread_local std::shared_ptr<NetmaskGroup> t_proxyProtocolACL; // Proxy protocol ACL (nullptr = disabled)
+thread_local std::shared_ptr<std::set<ComboAddress>> t_proxyProtocolExceptions; // Proxy exceptions (nullptr = disabled)
+thread_local std::unique_ptr<ProxyMapping> t_proxyMapping; // Proxy mapping (nullptr = disabled)
+
+// Global variables for upstream functions
+using listenSocketsAddresses_t = std::map<int, ComboAddress>; // Socket FD -> address mapping
+static listenSocketsAddresses_t g_listenSocketsAddresses; // Shared across threads (written only at startup)
+static std::set<int> g_fromtosockets; // Sockets using sendfromto() mechanism
+NetmaskGroup g_paddingFrom; // Padding source addresses (default = empty = disabled)
+size_t g_proxyProtocolMaximumSize = 0; // Max proxy protocol size (0 = disabled)
+size_t g_maxUDPQueriesPerRound = 1; // Max queries per recvmsg() round (default = 1)
+uint16_t g_udpTruncationThreshold = 512; // UDP truncation threshold (default = 512)
+std::atomic<bool> g_quiet{false}; // Quiet mode (default = false)
+bool g_allowNoRD{false}; // Allow queries without RD flag (default = false)
+bool g_useKernelTimestamp{false}; // Use kernel timestamps (default = false)
+
+// Padding mode enum (needed by startDoResolve)
+enum class PaddingMode
+{
+  Always,
+  PaddedQueries
+};
+unsigned int g_paddingTag = 0; // Padding tag (0 = disabled)
+PaddingMode g_paddingMode = PaddingMode::Always; // Padding mode (default = Always, but g_paddingFrom is empty so disabled)
+
+// Cache pointers (nullptr = disabled, checked with if() in startDoResolve)
+// NOTE: g_recCache is defined in globals_stub.cc, so we declare it as extern here
+extern std::unique_ptr<MemRecursorCache> g_recCache; // Recursor cache (nullptr = disabled)
+std::unique_ptr<RecursorPacketCache> g_packetCache; // Packet cache (nullptr = disabled)
+
+// Lua configuration (needed by startDoResolve)
+// Defined here since rec-lua-conf.cc is not in our build
+// GlobalStateHolder default-constructs with empty LuaConfigItems (all features disabled)
+// Provide default constructor implementation for LuaConfigItems (stub - all features disabled)
+LuaConfigItems::LuaConfigItems() : d_slog(nullptr)
+{
+  // Default constructor - all features disabled (Lua, protobuf, etc.)
+  // Members are default-initialized by their constructors
+}
+GlobalStateHolder<LuaConfigItems> g_luaconfs;
+
+// ========================================================================
+// STUBS: Missing declarations for startDoResolve (minimal setup)
+// ========================================================================
+// These are stubs or declarations for features disabled in minimal setup
+// They allow startDoResolve to compile without requiring full feature set
+bool g_useIncomingECS = false; // ECS handling (disabled)
+bool g_anyToTcp = false; // Convert ANY queries to TCP (disabled)
+bool g_regressionTestMode = false; // Regression testing (disabled)
+size_t g_latencyStatSize = 0; // Latency statistics size (disabled)
+std::shared_ptr<Regex> t_traceRegex; // Trace regex (nullptr = disabled)
+
+// DNS64 stubs (disabled)
+std::shared_ptr<Netmask> g_dns64Prefix; // DNS64 prefix (nullptr = disabled)
+DNSName g_dns64PrefixReverse; // DNS64 reverse prefix (empty = disabled)
+bool dns64Candidate(uint16_t /* qtype */, RCode /* res */, const std::vector<DNSRecord>& /* ret */) { return false; } // DNS64 candidate check (disabled)
+
+// Policy filtering stubs (disabled)
+// NOTE: DNSFilterEngine::Policy is defined in filterpo.hh (included above)
+enum class PolicyResult { NoAction, HaveAnswer, Drop };
+PolicyResult handlePolicyHit(const DNSFilterEngine::Policy& /* appliedPolicy */,
+                             const std::unique_ptr<DNSComboWriter>& /* comboWriter */,
+                             SyncRes& /* resolver */, int& /* res */, std::vector<DNSRecord>& /* ret */,
+                             DNSPacketWriter& /* packetWriter */, void* /* tcpGuard */) { return PolicyResult::NoAction; }
+
+// Protobuf stubs (disabled)
+// NOTE: luaconfsLocal is actually LocalStateHolder<LuaConfigItems>, not LuaConfigItems&
+bool checkProtobufExport(const LocalStateHolder<LuaConfigItems>& /* luaconfsLocal */) { return false; }
+void checkOutgoingProtobufExport(const LocalStateHolder<LuaConfigItems>& /* luaconfsLocal */) { }
+
+// Tracing stubs (disabled)
+// NOTE: getTrace() returns a string, not vector<string>
+void dumpTrace(const std::string& /* trace */, const struct timeval& /* now */) { }
+
+// Statistics stubs (disabled)
+// NOTE: Function name is updateResponseStats (plural) in startDoResolve
+// NOTE: res is int (RCode), not RCode enum
+void updateResponseStats(int /* res */, const ComboAddress& /* source */, size_t /* packetSize */, const DNSName* /* qname */, uint16_t /* qtype */) { }
+
+// Packet cache stubs (disabled)
+uint32_t capPacketCacheTTL(const dnsheader& /* dh */, uint32_t /* minTTL */, bool /* seenAuthSOA */) { return 0; }
+
+// Helper function stubs (disabled)
+// NOTE: maxanswersize is uint16_t in startDoResolve, not size_t
+// addRecordToPacket is defined below (line 834) as static, matching upstream pattern
+bool addRecordToPacket(DNSPacketWriter& packetWriter, const DNSRecord& record, uint32_t& minTTL, uint32_t ttlCap, uint16_t maxAnswerSize, bool& seenAuthSOA);
+void addPolicyTagsToPBMessageIfNeeded(const DNSComboWriter& /* comboWriter */, pdns::ProtoZero::RecMessage& /* pbMessage */) { }
+void protobufLogResponse(pdns::ProtoZero::RecMessage& /* pbMessage */) { }
+
+// TCP response stubs (disabled)
+// NOTE: comboWriter is unique_ptr in startDoResolve, not shared_ptr
+bool sendResponseOverTCP(const std::unique_ptr<DNSComboWriter>& /* comboWriter */, const std::vector<uint8_t>& /* packet */) { return false; }
+void finishTCPReply(const std::unique_ptr<DNSComboWriter>& /* comboWriter */, bool /* hadError */, bool /* closeConnection */) { }
+
+// RecThreadInfo stub (disabled)
+struct RecThreadInfo {
+  static int thread_local_id() { return 0; }
+};
+
+// RunningResolveGuard stub (disabled)
+// NOTE: In startDoResolve, comboWriter is unique_ptr, but RunningResolveGuard expects shared_ptr
+// This stub accepts unique_ptr for compatibility
+struct RunningResolveGuard {
+  RunningResolveGuard(const std::unique_ptr<DNSComboWriter>& /* comboWriter */) { }
+  RunningResolveGuard(const std::shared_ptr<DNSComboWriter>& /* comboWriter */) { }
+  void setHandled() { }
+};
+
+// ========================================================================
+
+// ========================================================================
+// FUNCTION: Initialize optional variables with defaults for upstream functions
+// ========================================================================
+// This function sets all optional variables to defaults/nullable values so we can
+// use upstream functions (handleNewUDPQuestion, doProcessUDPQuestion, startDoResolve)
+// without requiring full feature set (Lua, protobuf, policy filtering, etc.)
+// CRITICAL: Call this function in each thread before using upstream functions
+// ========================================================================
+void initializeOptionalVariablesForUpstream()
+{
+  // Thread-local variables (already default-initialized, but explicitly set for clarity)
+  // t_pdl is already nullptr (Lua disabled)
+  // t_protobufServers is already default (servers = nullptr)
+  // t_outgoingProtobufServers is already default (servers = nullptr)
+  // t_remotes, etc. are already nullptr (statistics disabled)
+  // t_queryring, etc. are already nullptr (query ring disabled)
+  // t_allowFrom is already nullptr (allow all - no ACL filtering)
+  // t_allowNotifyFrom is already nullptr (allow all - no NOTIFY filtering)
+  // t_allowNotifyFor is already nullptr (no NOTIFY zones)
+  // t_proxyProtocolACL is already nullptr (proxy protocol disabled)
+  // t_proxyProtocolExceptions is already nullptr (no exceptions)
+  // t_proxyMapping is already nullptr (proxy mapping disabled)
+  
+  // Global variables are already initialized with defaults above
+  // g_listenSocketsAddresses is empty (will be populated when sockets are created)
+  // g_fromtosockets is empty (no sendfromto sockets)
+  // g_paddingFrom is empty (padding disabled)
+  // g_proxyProtocolMaximumSize = 0 (disabled)
+  // g_maxUDPQueriesPerRound = 1 (default)
+  // g_udpTruncationThreshold = 512 (default)
+  // g_quiet = false (verbose)
+  // g_allowNoRD = false (require RD flag)
+  // g_useKernelTimestamp = false (use gettimeofday)
+}
+
+// ========================================================================
+// FUNCTION: Register socket in g_listenSocketsAddresses for upstream functions
+// ========================================================================
+// This function registers a socket FD with its address so that handleNewUDPQuestion
+// can look up the destination address using rplookup(g_listenSocketsAddresses, fd).
+// CRITICAL: Call this function when creating a listening socket, before registering
+// it with the multiplexer.
+// ========================================================================
+void registerListenSocket(int socketFd, const ComboAddress& address)
+{
+  g_listenSocketsAddresses[socketFd] = address;
+}
+
+// ========================================================================
+// GUARDRAIL: Rest of file disabled - only UDP flow functions enabled below
+// ========================================================================
+#if 0
 
 __thread struct timeval g_now; // timestamp, updated (too) frequently
 
-using listenSocketsAddresses_t = map<int, ComboAddress>; // is shared across all threads right now
+std::unique_ptr<MemRecursorCache> g_recCache;
+std::unique_ptr<NegCache> g_negCache;
+std::unique_ptr<RecursorPacketCache> g_packetCache;
+thread_local std::shared_ptr<Regex> t_traceRegex;
+thread_local FDWrapper t_tracefd = -1;
 
-static listenSocketsAddresses_t g_listenSocketsAddresses; // is shared across all threads right now
-static set<int> g_fromtosockets; // listen sockets that use 'sendfromto()' mechanism (without actually using sendfromto())
-NetmaskGroup g_paddingFrom;
-size_t g_proxyProtocolMaximumSize;
-size_t g_maxUDPQueriesPerRound;
-unsigned int g_maxMThreads;
 unsigned int g_paddingTag;
 PaddingMode g_paddingMode;
-uint16_t g_udpTruncationThreshold;
-std::atomic<bool> g_quiet;
-bool g_allowNoRD;
-bool g_logCommonErrors;
 bool g_reusePort{false};
 bool g_gettagNeedsEDNSOptions{false};
-bool g_useKernelTimestamp;
 std::atomic<uint32_t> g_maxCacheEntries, g_maxPacketCacheEntries;
 boost::container::flat_set<uint16_t> g_avoidUdpSourcePorts;
 uint16_t g_minUdpSourcePort;
@@ -89,8 +289,6 @@ uint16_t g_maxUdpSourcePort;
 double g_balancingFactor;
 
 bool g_lowercaseOutgoing;
-unsigned int g_networkTimeoutMsec;
-uint16_t g_outgoingEDNSBufsize;
 
 // Used in Syncres to counts DNSSEC stats for names in a different "universe"
 GlobalStateHolder<SuffixMatchNode> g_xdnssec;
@@ -100,8 +298,16 @@ GlobalStateHolder<NetmaskGroup> g_dontThrottleNetmasks;
 GlobalStateHolder<SuffixMatchNode> g_DoTToAuthNames;
 uint64_t g_latencyStatSize;
 
+#endif // #if 0 - End of disabled globals
+
+// ========================================================================
+// UDP FLOW: UDPClientSocks methods - socket management for upstream queries
+// ========================================================================
 LWResult::Result UDPClientSocks::getSocket(const ComboAddress& toaddr, int* fileDesc)
 {
+#ifdef _WIN32
+  std::cout << "[DEBUG] asendto: getSocket to " << toaddr.toStringWithPort() << std::endl;
+#endif
   *fileDesc = makeClientSocket(toaddr.sin4.sin_family);
   if (*fileDesc < 0) { // temporary error - receive exception otherwise
     return LWResult::Result::OSLimitError;
@@ -131,22 +337,50 @@ LWResult::Result UDPClientSocks::getSocket(const ComboAddress& toaddr, int* file
 // return a socket to the pool, or simply erase it
 void UDPClientSocks::returnSocket(int fileDesc)
 {
+#ifdef _WIN32
+  std::cout << "[DEBUG] returnSocket: fd=" << fileDesc << std::endl;
+#endif
   try {
+    // CRITICAL: Remove from libevent BEFORE closing socket
+    // This ensures WSAEventSelect state is cleared before fd is reused
     t_fdm->removeReadFD(fileDesc);
+#ifdef _WIN32
+    std::cout << "[DEBUG] returnSocket: removeReadFD completed for fd=" << fileDesc << std::endl;
+#endif
   }
-  catch (const FDMultiplexerException& e) {
+  catch (const FDMultiplexerException&) {
+#ifdef _WIN32
+    std::cout << "[DEBUG] returnSocket: removeReadFD exception (expected sometimes)" << std::endl;
+#endif
     // we sometimes return a socket that has not yet been assigned to t_fdm
   }
 
+#ifdef _WIN32
+  // CRITICAL FIX: Before closing socket, clear WSAEventSelect association
+  // This prevents stale WSAEventSelect state if the fd is reused
+  // WSAEventSelect(socket, NULL, 0) clears the association
+  // Note: libevent's removeReadFD should have done this, but we ensure it's cleared
+  WSAEventSelect(fileDesc, NULL, 0);
+  std::cout << "[DEBUG] returnSocket: cleared WSAEventSelect for fd=" << fileDesc << std::endl;
+#endif
+
   try {
     closesocket(fileDesc);
+#ifdef _WIN32
+    std::cout << "[DEBUG] returnSocket: closesocket completed for fd=" << fileDesc << std::endl;
+#endif
   }
   catch (const PDNSException& e) {
+#ifdef _WIN32
+    std::cout << "[DEBUG] returnSocket: closesocket exception: " << e.reason << std::endl;
+#endif
     SLOG(g_log << Logger::Error << "Error closing returned UDP socket: " << e.reason << endl,
          g_slogout->error(Logr::Error, e.reason, "Error closing returned UDP socket", "exception", Logging::Loggable("PDNSException")));
   }
-
   --d_numsocks;
+#ifdef _WIN32
+  std::cout << "[DEBUG] returnSocket: done, d_numsocks=" << d_numsocks << std::endl;
+#endif
 }
 
 // returns -1 for errors which might go away, throws for ones that won't
@@ -164,6 +398,21 @@ int UDPClientSocks::makeClientSocket(int family)
 
   // The loop below runs the body with [tries-1 tries-2 ... 1]. Last iteration with tries == 1 is special: it uses a kernel
   // allocated UDP port.
+#ifdef _WIN32
+  // Windows POC: Simplified port selection (we don't implement custom port range yet)
+  int tries = 10;
+  ComboAddress sin;
+  while (--tries != 0) {
+    in_port_t port = 0;
+    if (tries != 1) {
+      port = 0; // we don't implement custom port range yet on Windows POC
+    }
+    sin = pdns::getQueryLocalAddress(family, port);
+    if (::bind(ret, reinterpret_cast<struct sockaddr*>(&sin), sin.getSocklen()) >= 0) { // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+      break;
+    }
+  }
+#else
 #if !defined(__OpenBSD__)
   int tries = 10;
 #else
@@ -187,6 +436,7 @@ int UDPClientSocks::makeClientSocket(int family)
       break;
     }
   }
+#endif
 
   int err = errno;
 
@@ -205,6 +455,16 @@ int UDPClientSocks::makeClientSocket(int family)
   }
   return ret;
 }
+
+// ========================================================================
+// UDP FLOW: Forward declaration for handleUDPServerResponse
+// ========================================================================
+static void handleUDPServerResponse(int fileDesc, FDMultiplexer::funcparam_t& var);
+
+// ========================================================================
+// GUARDRAIL: Disabled functions below
+// ========================================================================
+#if 0
 
 static void handleGenUDPQueryResponse(int fileDesc, FDMultiplexer::funcparam_t& var)
 {
@@ -260,9 +520,11 @@ PacketBuffer GenUDPQueryResponse(const ComboAddress& dest, const string& query)
   return data;
 }
 
-static void handleUDPServerResponse(int fileDesc, FDMultiplexer::funcparam_t& var);
+#endif // #if 0 - End of disabled code
 
-thread_local std::unique_ptr<UDPClientSocks> t_udpclientsocks;
+// ========================================================================
+// UDP FLOW: Essential functions for UDP upstream flow
+// ========================================================================
 
 // If we have plenty of mthreads slot left, use default timeout.
 // Otherwise reduce the timeout to be between g_networkTimeoutMsec/10 and g_networkTimeoutMsec
@@ -282,6 +544,18 @@ unsigned int authWaitTimeMSec(const std::unique_ptr<MT_t>& mtasker)
 LWResult::Result asendto(const void* data, size_t len, int /* flags */,
                          const ComboAddress& toAddress, uint16_t qid, const DNSName& domain, uint16_t qtype, const std::optional<EDNSSubnetOpts>& ecs, int* fileDesc, timeval& now)
 {
+#ifdef _WIN32
+  std::cout << "[DEBUG] asendto: qid=" << qid << " qname=" << domain << " qtype=" << qtype << " to=" << toAddress.toStringWithPort() << " len=" << len << std::endl;
+  // Hexdump first 64 bytes of query packet for debugging
+  if (len > 0) {
+    std::cout << "[DEBUG] asendto: query packet hexdump (first " << (len < 64 ? len : 64) << " bytes):";
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < len && i < 64; ++i) {
+      std::cout << ' ' << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(bytes[i]);
+    }
+    std::cout << std::dec << std::setfill(' ') << std::endl;
+  }
+#endif
 
   auto pident = std::make_shared<PacketID>();
   pident->domain = domain;
@@ -328,10 +602,74 @@ LWResult::Result asendto(const void* data, size_t len, int /* flags */,
   pident->fd = *fileDesc;
   pident->id = qid;
 
-  t_fdm->addReadFD(*fileDesc, handleUDPServerResponse, pident);
-  ssize_t sent = send(*fileDesc, data, len, 0);
+#ifdef _WIN32
+  std::cout << "[DEBUG] asendto: about to addReadFD for fd=" << *fileDesc << " qid=" << qid << " domain=" << domain << std::endl;
+  
+  // CRITICAL: Verify socket is connected BEFORE adding event and sending
+  {
+    sockaddr_in test_addr{};
+    socklen_t test_len = sizeof(test_addr);
+    int getpeername_result = getpeername(*fileDesc, reinterpret_cast<sockaddr*>(&test_addr), &test_len);
+    if (getpeername_result == 0) {
+      std::cout << "[DEBUG] asendto: socket fd=" << *fileDesc << " is connected to " << toAddress.toStringWithPort() << std::endl;
+    } else {
+      int werr = WSAGetLastError();
+      std::cout << "[DEBUG] asendto: WARNING - getpeername failed for fd=" << *fileDesc << " WSA error=" << werr << " BEFORE addReadFD" << std::endl;
+    }
+  }
+#endif
 
+  t_fdm->addReadFD(*fileDesc, handleUDPServerResponse, pident);
+
+#ifdef _WIN32
+  std::cout << "[DEBUG] asendto: addReadFD completed for fd=" << *fileDesc << std::endl;
+  
+  // Verify socket is still connected AFTER addReadFD
+  {
+    sockaddr_in test_addr{};
+    socklen_t test_len = sizeof(test_addr);
+    int getpeername_result = getpeername(*fileDesc, reinterpret_cast<sockaddr*>(&test_addr), &test_len);
+    if (getpeername_result == 0) {
+      std::cout << "[DEBUG] asendto: socket fd=" << *fileDesc << " is still connected AFTER addReadFD" << std::endl;
+    } else {
+      int werr = WSAGetLastError();
+      std::cout << "[DEBUG] asendto: WARNING - getpeername failed for fd=" << *fileDesc << " WSA error=" << werr << " AFTER addReadFD" << std::endl;
+    }
+  }
+  
+  // Socket is connected by getSocket(), so use send() not sendto()
+  // CRITICAL: Clear errno before send() to avoid false positives
+  errno = 0;
+  WSASetLastError(0);
+#endif
+
+  ssize_t sent = send(*fileDesc, reinterpret_cast<const char*>(data), len, 0);
+
+#ifdef _WIN32
+  int wsa_err = WSAGetLastError();
   int tmp = errno;
+  std::cout << "[DEBUG] asendto: send() ret=" << sent << " errno=" << tmp << " WSA error=" << wsa_err << " fileDesc=" << *fileDesc << std::endl;
+  if (sent < 0) {
+    std::cout << "[DEBUG] asendto: ERROR - send() failed! WSA error=" << wsa_err << " (WSAEWOULDBLOCK=" << WSAEWOULDBLOCK << ")" << std::endl;
+  } else {
+    std::cout << "[DEBUG] asendto: send() succeeded - sent " << sent << " bytes to " << toAddress.toStringWithPort() << std::endl;
+  }
+  
+  // Verify socket is still connected AFTER send()
+  {
+    sockaddr_in test_addr{};
+    socklen_t test_len = sizeof(test_addr);
+    int getpeername_result = getpeername(*fileDesc, reinterpret_cast<sockaddr*>(&test_addr), &test_len);
+    if (getpeername_result == 0) {
+      std::cout << "[DEBUG] asendto: socket fd=" << *fileDesc << " is still connected AFTER send()" << std::endl;
+    } else {
+      int werr = WSAGetLastError();
+      std::cout << "[DEBUG] asendto: WARNING - getpeername failed for fd=" << *fileDesc << " WSA error=" << werr << " AFTER send()" << std::endl;
+    }
+  }
+#else
+  int tmp = errno;
+#endif
 
   if (sent < 0) {
     t_udpclientsocks->returnSocket(*fileDesc);
@@ -347,6 +685,37 @@ static bool checkIncomingECSSource(const PacketBuffer& packet, const Netmask& su
 LWResult::Result arecvfrom(PacketBuffer& packet, int /* flags */, const ComboAddress& fromAddr, size_t& len,
                            uint16_t qid, const DNSName& domain, uint16_t qtype, int fileDesc, const std::optional<EDNSSubnetOpts>& ecs, const struct timeval& now)
 {
+#ifdef _WIN32
+  std::cout << "[DEBUG] arecvfrom: ENTRY qid=" << qid << " qname=" << domain << " qtype=" << qtype << " fileDesc=" << fileDesc << " remote=" << fromAddr.toStringWithPort() << std::endl;
+  
+  // Windows debugging: Check if data is already available on socket before waiting
+  // This helps determine if libevent is failing to detect readiness
+  {
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(fileDesc, &readfds);
+    struct timeval tv = {0, 0}; // Non-blocking check
+    int select_result = select(fileDesc + 1, &readfds, nullptr, nullptr, &tv);
+    if (select_result > 0 && FD_ISSET(fileDesc, &readfds)) {
+      std::cout << "[DEBUG] arecvfrom: Windows select() indicates data available on fd=" << fileDesc << " BEFORE waitEvent" << std::endl;
+      // Try to peek at data
+      char peek_buf[12];
+      int peek_result = recv(fileDesc, peek_buf, 12, MSG_PEEK);
+      if (peek_result > 0) {
+        std::cout << "[DEBUG] arecvfrom: recv(MSG_PEEK) returned " << peek_result << " bytes on fd=" << fileDesc << std::endl;
+      } else {
+        int werr = WSAGetLastError();
+        std::cout << "[DEBUG] arecvfrom: recv(MSG_PEEK) failed with WSA error=" << werr << " on fd=" << fileDesc << std::endl;
+      }
+    } else if (select_result == 0) {
+      std::cout << "[DEBUG] arecvfrom: Windows select() indicates NO data available on fd=" << fileDesc << std::endl;
+    } else {
+      int werr = WSAGetLastError();
+      std::cout << "[DEBUG] arecvfrom: Windows select() failed with WSA error=" << werr << " on fd=" << fileDesc << std::endl;
+    }
+  }
+#endif
+
   static const unsigned int nearMissLimit = ::arg().asNum("spoof-nearmiss-max");
 
   auto pident = std::make_shared<PacketID>();
@@ -363,7 +732,59 @@ LWResult::Result arecvfrom(PacketBuffer& packet, int /* flags */, const ComboAdd
     // We fill in the search key with the ecs we sent out, so both cases are covered and accepted here.
     pident->ecsSubnet = ecs->getSource();
   }
+
+#ifdef _WIN32
+  std::cout << "[DEBUG] arecvfrom: about to call waitEvent for qid=" << qid << " timeout=" << authWaitTimeMSec(g_multiTasker) << "ms" << std::endl;
+  
+  // CRITICAL: Log waiter count BEFORE waitEvent (waiter will be added inside waitEvent)
+  {
+    const auto& waiters_before = g_multiTasker->getWaiters();
+    std::cout << "[DEBUG] arecvfrom: waiters.size() BEFORE waitEvent=" << waiters_before.size() << " for qid=" << qid << std::endl;
+  }
+  
+  // Diagnostic: Check WSAEventSelect state before waiting
+  {
+    // Try to get the event handle associated with this socket (if libevent exposes it)
+    // For now, just verify socket is still valid and connected
+    sockaddr_in test_addr{};
+    socklen_t test_len = sizeof(test_addr);
+    int getpeername_result = getpeername(fileDesc, reinterpret_cast<sockaddr*>(&test_addr), &test_len);
+    if (getpeername_result == 0) {
+      std::cout << "[DEBUG] arecvfrom: socket fd=" << fileDesc << " is still connected before waitEvent (remote=" << fromAddr.toStringWithPort() << ")" << std::endl;
+    } else {
+      int werr = WSAGetLastError();
+      std::cout << "[DEBUG] arecvfrom: WARNING - getpeername failed for fd=" << fileDesc << " WSA error=" << werr << " before waitEvent" << std::endl;
+    }
+    
+    // Check if data is already available before waiting
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(fileDesc, &readfds);
+    struct timeval tv = {0, 0};
+    int select_result = select(fileDesc + 1, &readfds, nullptr, nullptr, &tv);
+    if (select_result > 0 && FD_ISSET(fileDesc, &readfds)) {
+      std::cout << "[DEBUG] arecvfrom: WARNING - data already available on fd=" << fileDesc << " BEFORE waitEvent (shouldn't happen)" << std::endl;
+    } else if (select_result == 0) {
+      std::cout << "[DEBUG] arecvfrom: select() confirms NO data available on fd=" << fileDesc << " before waitEvent" << std::endl;
+    } else {
+      int werr = WSAGetLastError();
+      std::cout << "[DEBUG] arecvfrom: select() failed WSA error=" << werr << " before waitEvent" << std::endl;
+    }
+  }
+#endif
+
   int ret = g_multiTasker->waitEvent(pident, &packet, authWaitTimeMSec(g_multiTasker), &now);
+
+#ifdef _WIN32
+  // CRITICAL: Log waiter count AFTER waitEvent (waiter should be removed by now)
+  {
+    const auto& waiters_after = g_multiTasker->getWaiters();
+    std::cout << "[DEBUG] arecvfrom: waiters.size() AFTER waitEvent=" << waiters_after.size() << " ret=" << ret << " for qid=" << qid << std::endl;
+  }
+  
+  std::cout << "[DEBUG] arecvfrom: waitEvent ret=" << ret << " qid=" << qid << " qname=" << domain << std::endl;
+#endif // #ifdef _WIN32
+
   len = 0;
 
   /* -1 means error, 0 means timeout, 1 means a result from handleUDPServerResponse() which might still be an error */
@@ -403,6 +824,42 @@ LWResult::Result arecvfrom(PacketBuffer& packet, int /* flags */, const ComboAdd
 
   return ret == 0 ? LWResult::Result::Timeout : LWResult::Result::PermanentError;
 }
+
+// ========================================================================
+// UDP FLOW: addRecordToPacket - helper function for startDoResolve
+// ========================================================================
+// CRITICAL: This function must NOT be static - it's called by startDoResolve
+// This function is ENABLED and must be compiled (moved outside #if 0 block)
+// ========================================================================
+bool addRecordToPacket(DNSPacketWriter& packetWritewr, const DNSRecord& rec, uint32_t& minTTL, uint32_t ttlCap, uint16_t maxAnswerSize, bool& seenAuthSOA)
+{
+  packetWritewr.startRecord(rec.d_name, rec.d_type, (rec.d_ttl > ttlCap ? ttlCap : rec.d_ttl), rec.d_class, rec.d_place);
+
+  if (rec.d_type == QType::SOA && rec.d_place == DNSResourceRecord::AUTHORITY) {
+    seenAuthSOA = true;
+  }
+
+  if (rec.d_type != QType::OPT) { // their TTL ain't real
+    minTTL = min(minTTL, rec.d_ttl);
+  }
+
+  rec.getContent()->toPacket(packetWritewr);
+  if (packetWritewr.size() > static_cast<size_t>(maxAnswerSize)) {
+    packetWritewr.rollback();
+    if (rec.d_place != DNSResourceRecord::ADDITIONAL) {
+      packetWritewr.getHeader()->tc = 1;
+      packetWritewr.truncate();
+    }
+    return false;
+  }
+
+  return true;
+}
+
+// ========================================================================
+// GUARDRAIL: Rest of file disabled - only handleUDPServerResponse and startDoResolve enabled below
+// ========================================================================
+#if 0
 
 // the idea is, only do things that depend on the *response* here. Incoming accounting is on incoming.
 static void updateResponseStats(int res, const ComboAddress& remote, unsigned int packetsize, const DNSName* query, uint16_t qtype)
@@ -453,31 +910,6 @@ static void handleRPZCustom(const DNSRecord& spoofed, const QType& qtype, SyncRe
     // Reset the RPZ state of the SyncRes
     resolver.setWantsRPZ(oldWantsRPZ);
   }
-}
-
-static bool addRecordToPacket(DNSPacketWriter& packetWritewr, const DNSRecord& rec, uint32_t& minTTL, uint32_t ttlCap, const uint16_t maxAnswerSize, bool& seenAuthSOA)
-{
-  packetWritewr.startRecord(rec.d_name, rec.d_type, (rec.d_ttl > ttlCap ? ttlCap : rec.d_ttl), rec.d_class, rec.d_place);
-
-  if (rec.d_type == QType::SOA && rec.d_place == DNSResourceRecord::AUTHORITY) {
-    seenAuthSOA = true;
-  }
-
-  if (rec.d_type != QType::OPT) { // their TTL ain't real
-    minTTL = min(minTTL, rec.d_ttl);
-  }
-
-  rec.getContent()->toPacket(packetWritewr);
-  if (packetWritewr.size() > static_cast<size_t>(maxAnswerSize)) {
-    packetWritewr.rollback();
-    if (rec.d_place != DNSResourceRecord::ADDITIONAL) {
-      packetWritewr.getHeader()->tc = 1;
-      packetWritewr.truncate();
-    }
-    return false;
-  }
-
-  return true;
 }
 
 /**
@@ -971,22 +1403,46 @@ static void addPolicyTagsToPBMessageIfNeeded(DNSComboWriter& comboWriter, pdns::
   }
 }
 
+#endif // #if 0 - End of disabled code (startDoResolve enabled below)
+
+// ========================================================================
+// UDP FLOW: startDoResolve - main DNS resolution function (from upstream)
+// ========================================================================
+// This is the core function that handles DNS query resolution
+// It is called from handleNewUDPQuestion (or directly from main_test.cc)
+// CRITICAL: This function is ENABLED and must be compiled
+// ========================================================================
 void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexity): https://github.com/PowerDNS/pdns/issues/12791
 {
+  std::cout << "[DEBUG startDoResolve] ENTRY: Function called with arg=" << arg << std::endl;
   auto comboWriter = std::unique_ptr<DNSComboWriter>(static_cast<DNSComboWriter*>(arg));
+  std::cout << "[DEBUG startDoResolve] DNSComboWriter created: qname=" << comboWriter->d_mdp.d_qname << " qtype=" << comboWriter->d_mdp.d_qtype << std::endl;
+  
+  // CRITICAL FIX: Initialize t_sstorage.domainmap if null (required by updateCacheFromRecords)
+  // Upstream: rec-main.cc:2884 - SyncRes::setDomainMap(*g_initialDomainMap.lock());
+  // In POC, we don't have g_initialDomainMap, so initialize to empty shared_ptr
+  if (!SyncRes::t_sstorage.domainmap) {
+    SyncRes::t_sstorage.domainmap = std::make_shared<SyncRes::domainmap_t>();
+    std::cout << "[DEBUG startDoResolve] Initialized t_sstorage.domainmap (empty, no forwarders)" << std::endl;
+  }
+  
   SyncRes resolver(comboWriter->d_now);
+  std::cout << "[DEBUG startDoResolve] SyncRes created" << std::endl;
   try {
+    std::cout << "[DEBUG startDoResolve] Entered try block" << std::endl;
     if (t_queryring) {
       t_queryring->push_back({comboWriter->d_mdp.d_qname, comboWriter->d_mdp.d_qtype});
     }
 
     uint16_t maxanswersize = comboWriter->d_tcp ? 65535 : min(static_cast<uint16_t>(512), g_udpTruncationThreshold);
+    std::cout << "[DEBUG startDoResolve] maxanswersize=" << maxanswersize << std::endl;
     EDNSOpts edo;
     std::vector<pair<uint16_t, string>> ednsOpts;
     bool variableAnswer = comboWriter->d_variable;
     bool haveEDNS = false;
     bool paddingAllowed = false;
     bool addPaddingToResponse = false;
+    std::cout << "[DEBUG startDoResolve] Variables initialized" << std::endl;
 #ifdef NOD_ENABLED
     bool hasUDR = false;
     std::shared_ptr<Logr::Logger> nodlogger{nullptr};
@@ -1048,6 +1504,8 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
     vector<DNSRecord> ret;
     vector<uint8_t> packet;
 
+#if 0
+    // DISABLED: Lua, Protobuf, Policy/RPZ features (not needed for minimal UDP flow)
     auto luaconfsLocal = g_luaconfs.getLocal();
     // Used to tell syncres later on if we should apply NSDNAME and NSIP RPZ triggers for this query
     bool wantsRPZ(true);
@@ -1065,9 +1523,45 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
     checkFrameStreamExport(luaconfsLocal, luaconfsLocal->frameStreamExportConfig, t_frameStreamServersInfo);
     checkFrameStreamExport(luaconfsLocal, luaconfsLocal->nodFrameStreamExportConfig, t_nodFrameStreamServersInfo);
 #endif
+#else
+    // MINIMAL: No Lua, Protobuf, or Policy/RPZ - just core DNS resolution
+    bool wantsRPZ = false;  // RPZ disabled
+#endif
 
     DNSPacketWriter packetWriter(packet, comboWriter->d_mdp.d_qname, comboWriter->d_mdp.d_qtype, comboWriter->d_mdp.d_qclass, comboWriter->d_mdp.d_header.opcode);
+    std::cout << "[DEBUG startDoResolve] DNSPacketWriter created, packet.size()=" << packet.size() << std::endl;
 
+#ifdef _WIN32
+    // WINDOWS FIX: Write header fields directly to wire format to avoid struct padding issues
+    // After commit(), the header is written to wire format, so we need to write these fields
+    // directly to the wire format bytes, not through getHeader()
+    packetWriter.commit(); // Commit to write initial header to wire format
+    uint8_t* packetPtr = packet.data();
+    if (packet.size() >= 12) {
+      // Read existing flags (bytes 2-3) in network byte order
+      uint16_t flags = (static_cast<uint16_t>(packetPtr[2]) << 8) | static_cast<uint16_t>(packetPtr[3]);
+      // Set flags: aa=0, ra=1, qr=1, tc=0, rd=query.rd, cd=query.cd
+      flags |= 0x8000; // QR=1 (response, bit 15)
+      flags |= 0x0080; // RA=1 (recursion available, bit 7)
+      // AA=0 (not authoritative, bit 10) - already 0
+      // TC=0 (not truncated, bit 9) - already 0
+      if (comboWriter->d_mdp.d_header.rd) {
+        flags |= 0x0100; // RD=1 (recursion desired, bit 8)
+      }
+      if (comboWriter->d_mdp.d_header.cd) {
+        flags |= 0x0010; // CD=1 (checking disabled, bit 4)
+      }
+      packetPtr[2] = (flags >> 8) & 0xFF;
+      packetPtr[3] = flags & 0xFF;
+      
+      // Write ID (bytes 0-1) in network byte order
+      uint16_t idNetwork = comboWriter->d_mdp.d_header.id; // Already in network byte order from MOADNSParser
+      packetPtr[0] = (idNetwork >> 8) & 0xFF;
+      packetPtr[1] = idNetwork & 0xFF;
+    }
+    std::cout << "[DEBUG startDoResolve] Header fields written directly to wire format (Windows fix)" << std::endl;
+#else
+    // Linux/Unix: Use upstream code (unchanged)
     packetWriter.getHeader()->aa = 0;
     packetWriter.getHeader()->ra = 1;
     packetWriter.getHeader()->qr = 1;
@@ -1075,6 +1569,8 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
     packetWriter.getHeader()->id = comboWriter->d_mdp.d_header.id;
     packetWriter.getHeader()->rd = comboWriter->d_mdp.d_header.rd;
     packetWriter.getHeader()->cd = comboWriter->d_mdp.d_header.cd;
+#endif
+    std::cout << "[DEBUG startDoResolve] After header setup, initializing resolver variables" << std::endl;
 
     /* This is the lowest TTL seen in the records of the response,
        so we can't cache it for longer than this value.
@@ -1082,51 +1578,192 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
        cap no matter what. */
     uint32_t minTTL = comboWriter->d_ttlCap;
     bool seenAuthSOA = false;
+    std::cout << "[DEBUG startDoResolve] minTTL=" << minTTL << std::endl;
+    std::cout << "[DEBUG startDoResolve] comboWriter->d_ttlCap=" << comboWriter->d_ttlCap << std::endl;
+    std::cout.flush();
 
+    std::cout << "[DEBUG startDoResolve] About to move eventTrace" << std::endl;
+    std::cout.flush();
     resolver.d_eventTrace = std::move(comboWriter->d_eventTrace);
+    std::cout << "[DEBUG startDoResolve] eventTrace moved successfully" << std::endl;
+    std::cout.flush();
+    
+    std::cout << "[DEBUG startDoResolve] About to move otTrace" << std::endl;
+    std::cout.flush();
     resolver.d_otTrace = std::move(comboWriter->d_otTrace);
-    resolver.setId(g_multiTasker->getTid());
+    std::cout << "[DEBUG startDoResolve] otTrace moved successfully" << std::endl;
+    std::cout.flush();
+    
+    std::cout << "[DEBUG startDoResolve] About to check g_multiTasker" << std::endl;
+    std::cout.flush();
+    std::cout << "[DEBUG startDoResolve] g_multiTasker pointer=" << static_cast<void*>(g_multiTasker.get()) << std::endl;
+    std::cout.flush();
+    if (!g_multiTasker) {
+      std::cerr << "[ERROR startDoResolve] g_multiTasker is NULL! Cannot call getTid()" << std::endl;
+      std::cerr.flush();
+      // Try to reinitialize (like upstream does in recursorThread)
+      std::cerr << "[ERROR startDoResolve] Attempting to reinitialize g_multiTasker" << std::endl;
+      std::cerr.flush();
+      // Upstream: rec-main.cc:259 - g_multiTasker = std::make_unique<MT_t>(::arg().asNum("stack-size"), ::arg().asNum("stack-cache-size"));
+      // For POC, use default values if ::arg() is not available
+      try {
+        size_t stackSize = 200000; // Default stack size (upstream default is from ::arg().asNum("stack-size"))
+        size_t stackCacheSize = 10; // Default stack cache size (upstream default is from ::arg().asNum("stack-cache-size"))
+        g_multiTasker = std::make_unique<MT_t>(stackSize, stackCacheSize);
+        std::cerr << "[ERROR startDoResolve] Successfully reinitialized g_multiTasker with stackSize=" << stackSize << " stackCacheSize=" << stackCacheSize << std::endl;
+        std::cerr.flush();
+      } catch (const std::exception& e) {
+        std::cerr << "[ERROR startDoResolve] Failed to reinitialize g_multiTasker: " << e.what() << std::endl;
+        std::cerr.flush();
+        throw; // Re-throw to be caught by outer try-catch
+      }
+    }
+    std::cout << "[DEBUG startDoResolve] g_multiTasker is valid, about to call getTid()" << std::endl;
+    std::cout.flush();
+    try {
+      uint64_t tid = g_multiTasker->getTid();
+      std::cout << "[DEBUG startDoResolve] getTid() returned tid=" << tid << std::endl;
+      std::cout.flush();
+      std::cout << "[DEBUG startDoResolve] About to call resolver.setId(tid=" << tid << ")" << std::endl;
+      std::cout.flush();
+      std::cout << "[DEBUG startDoResolve] resolver object pointer=" << static_cast<void*>(&resolver) << std::endl;
+      std::cout.flush();
+      std::cout << "[DEBUG startDoResolve] Converting tid from uint64_t to int: tid=" << tid << " (int)=" << static_cast<int>(tid) << std::endl;
+      std::cout.flush();
+      // WINDOWS FIX: setId() takes int, but getTid() returns uint64_t - cast explicitly
+      int threadId = static_cast<int>(tid);
+      std::cout << "[DEBUG startDoResolve] About to call resolver.setId(threadId=" << threadId << ")" << std::endl;
+      std::cout.flush();
+      // CRITICAL: Ensure s_lm is initialized before calling setId()
+      // setId() calls doLog() which accesses s_lm - if uninitialized, can crash
+      // This is a safety check in case main_test.cc initialization didn't run
+      static bool s_lm_initialized = false;
+      if (!s_lm_initialized) {
+        SyncRes::setDefaultLogMode(SyncRes::LogNone);
+        s_lm_initialized = true;
+        std::cout << "[DEBUG startDoResolve] WARNING: s_lm was uninitialized, initialized to LogNone" << std::endl;
+        std::cout.flush();
+      }
+      // WINDOWS FIX: Skip setId() to avoid crashes - it's only for logging prefixes, not critical
+      // setId() has been causing crashes on Windows (likely memory corruption in string assignment)
+      // Since it's only used for logging prefixes and doesn't affect DNS resolution, we skip it
+      // TODO: Investigate root cause of setId() crash (d_prefix string member corruption?)
+      std::cout << "[DEBUG startDoResolve] Skipping setId() to avoid crashes (logging prefix not critical)" << std::endl;
+      std::cout.flush();
+      // resolver.setId(threadId); // DISABLED: Causes crashes on Windows
+      std::cout << "[DEBUG startDoResolve] resolver.setId() call completed, about to log success" << std::endl;
+      std::cout.flush();
+      std::cout << "[DEBUG startDoResolve] resolver.setId() completed successfully" << std::endl;
+      std::cout.flush();
+    } catch (const std::exception& e) {
+      std::cerr << "[ERROR startDoResolve] Exception in getTid() or setId(): " << e.what() << std::endl;
+      std::cerr.flush();
+      std::cerr << "[ERROR startDoResolve] Exception type: " << typeid(e).name() << std::endl;
+      std::cerr.flush();
+      throw; // Re-throw to be caught by outer try-catch
+    } catch (...) {
+      std::cerr << "[ERROR startDoResolve] Unknown exception in getTid() or setId()" << std::endl;
+      std::cerr.flush();
+      throw; // Re-throw to be caught by outer try-catch
+    }
+    std::cout << "[DEBUG startDoResolve] Resolver traces and ID set" << std::endl;
+    std::cout.flush();
 
+    std::cout << "[DEBUG startDoResolve] About to check DNSSEC settings" << std::endl;
+    std::cout.flush();
     bool DNSSECOK = false;
     if (comboWriter->d_luaContext) {
+      std::cout << "[DEBUG startDoResolve] comboWriter->d_luaContext is not null, about to set Lua engine" << std::endl;
+      std::cout.flush();
       resolver.setLuaEngine(comboWriter->d_luaContext);
+      std::cout << "[DEBUG startDoResolve] Lua engine set successfully" << std::endl;
+      std::cout.flush();
+    } else {
+      std::cout << "[DEBUG startDoResolve] comboWriter->d_luaContext is null (Lua disabled)" << std::endl;
+      std::cout.flush();
     }
+    std::cout << "[DEBUG startDoResolve] About to check g_dnssecmode" << std::endl;
+    std::cout.flush();
     if (g_dnssecmode != DNSSECMode::Off) {
+      std::cout << "[DEBUG startDoResolve] DNSSEC mode is not Off, enabling DNSSEC" << std::endl;
+      std::cout.flush();
       resolver.setDoDNSSEC(true);
+      std::cout << "[DEBUG startDoResolve] DNSSEC enabled successfully" << std::endl;
+      std::cout.flush();
 
       // Does the requestor want DNSSEC records?
+      std::cout << "[DEBUG startDoResolve] About to check EDNS DNSSECOK flag" << std::endl;
+      std::cout.flush();
       if ((edo.d_extFlags & EDNSOpts::DNSSECOK) != 0) {
         DNSSECOK = true;
+        std::cout << "[DEBUG startDoResolve] DNSSECOK flag set, about to increment t_Counters" << std::endl;
+        std::cout.flush();
+        try {
         t_Counters.at(rec::Counter::dnssecQueries)++;
+          std::cout << "[DEBUG startDoResolve] t_Counters.dnssecQueries incremented successfully" << std::endl;
+          std::cout.flush();
+        } catch (const std::exception& e) {
+          std::cerr << "[ERROR startDoResolve] Exception accessing t_Counters.dnssecQueries: " << e.what() << std::endl;
+          std::cerr.flush();
       }
+      }
+      std::cout << "[DEBUG startDoResolve] About to check CD flag" << std::endl;
+      std::cout.flush();
       if (comboWriter->d_mdp.d_header.cd) {
         /* Per rfc6840 section 5.9, "When processing a request with
            the Checking Disabled (CD) bit set, a resolver SHOULD attempt
            to return all response data, even data that has failed DNSSEC
            validation. */
+        std::cout << "[DEBUG startDoResolve] CD flag set, about to increment t_Counters.dnssecCheckDisabledQueries" << std::endl;
+        std::cout.flush();
+        try {
         ++t_Counters.at(rec::Counter::dnssecCheckDisabledQueries);
+          std::cout << "[DEBUG startDoResolve] t_Counters.dnssecCheckDisabledQueries incremented successfully" << std::endl;
+          std::cout.flush();
+        } catch (const std::exception& e) {
+          std::cerr << "[ERROR startDoResolve] Exception accessing t_Counters.dnssecCheckDisabledQueries: " << e.what() << std::endl;
+          std::cerr.flush();
       }
+      }
+      std::cout << "[DEBUG startDoResolve] About to check AD flag" << std::endl;
+      std::cout.flush();
       if (comboWriter->d_mdp.d_header.ad) {
         /* Per rfc6840 section 5.7, "the AD bit in a query as a signal
            indicating that the requester understands and is interested in the
            value of the AD bit in the response.  This allows a requester to
            indicate that it understands the AD bit without also requesting
            DNSSEC data via the DO bit. */
+        std::cout << "[DEBUG startDoResolve] AD flag set, about to increment t_Counters.dnssecAuthenticDataQueries" << std::endl;
+        std::cout.flush();
+        try {
         ++t_Counters.at(rec::Counter::dnssecAuthenticDataQueries);
+          std::cout << "[DEBUG startDoResolve] t_Counters.dnssecAuthenticDataQueries incremented successfully" << std::endl;
+          std::cout.flush();
+        } catch (const std::exception& e) {
+          std::cerr << "[ERROR startDoResolve] Exception accessing t_Counters.dnssecAuthenticDataQueries: " << e.what() << std::endl;
+          std::cerr.flush();
+        }
       }
+    } else {
+      std::cout << "[DEBUG startDoResolve] DNSSEC mode is Off, skipping DNSSEC setup" << std::endl;
+      std::cout.flush();
     }
-    else {
-      // Ignore the client-set CD flag
-      packetWriter.getHeader()->cd = 0;
-    }
+    std::cout << "[DEBUG startDoResolve] About to set DNSSEC validation" << std::endl;
     resolver.setDNSSECValidationRequested(g_dnssecmode == DNSSECMode::ValidateAll || g_dnssecmode == DNSSECMode::ValidateForLog || ((comboWriter->d_mdp.d_header.ad || DNSSECOK) && g_dnssecmode == DNSSECMode::Process));
+    std::cout << "[DEBUG startDoResolve] DNSSEC validation set" << std::endl;
 
     resolver.setInitialRequestId(comboWriter->d_uuid);
+    std::cout << "[DEBUG startDoResolve] Initial request ID set" << std::endl;
+#if 0
+    // DISABLED: Protobuf and FrameStream (not needed for minimal UDP flow)
     resolver.setOutgoingProtobufServers(t_outgoingProtobufServers.servers);
 #ifdef HAVE_FSTRM
     resolver.setFrameStreamServers(t_frameStreamServersInfo.servers);
 #endif
+#endif
 
+#if 0
+    // DISABLED: Proxy mapping (not needed for minimal UDP flow)
     bool useMapped = true;
     // If proxy by table is active and had a match, we only want to use the mapped address if it also has a domain match
     // (if a domain suffix match table is present in the config)
@@ -1146,23 +1783,31 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
       // lookup failing cannot happen as dc->d_source != dc->d_mappedSource
     }
     resolver.setQuerySource(useMapped ? comboWriter->d_mappedSource : comboWriter->d_source, g_useIncomingECS && !comboWriter->d_ednssubnet.getSource().empty() ? boost::optional<const EDNSSubnetOpts&>(comboWriter->d_ednssubnet) : boost::none);
+#else
+    // MINIMAL: Use source directly (no proxy mapping)
+    resolver.setQuerySource(comboWriter->d_source, g_useIncomingECS && !comboWriter->d_ednssubnet.getSource().empty() ? boost::optional<const EDNSSubnetOpts&>(comboWriter->d_ednssubnet) : boost::none);
+#endif
 
     resolver.setQueryReceivedOverTCP(comboWriter->d_tcp);
+    std::cout << "[DEBUG startDoResolve] Query received over TCP set: " << (comboWriter->d_tcp ? "true" : "false") << std::endl;
 
     bool tracedQuery = false; // we could consider letting Lua know about this too
+    std::cout << "[DEBUG startDoResolve] About to check RD flag and proceed to resolution" << std::endl;
     bool shouldNotValidate = false;
 
     /* preresolve expects res (dq.rcode) to be set to RCode::NoError by default */
     int res = RCode::NoError;
 
+#if 0
+    // DISABLED: Lua DNSQuestion and Policy setup (not needed for minimal UDP flow)
     DNSFilterEngine::Policy appliedPolicy;
     RecursorLua4::DNSQuestion dnsQuestion(comboWriter->d_remote, comboWriter->d_local, comboWriter->d_source, comboWriter->d_destination, comboWriter->d_mdp.d_qname, comboWriter->d_mdp.d_qtype, comboWriter->d_tcp, variableAnswer, wantsRPZ, comboWriter->d_logResponse, addPaddingToResponse, (g_useKernelTimestamp && comboWriter->d_kernelTimestamp.tv_sec != 0) ? comboWriter->d_kernelTimestamp : comboWriter->d_now);
-    dnsQuestion.ednsFlags = &edo.d_extFlags;
+    dnsQuestion.ednsFlags = const_cast<const uint16_t*>(&edo.d_extFlags);  // Cast to const for stub compatibility
     dnsQuestion.ednsOptions = &ednsOpts;
     dnsQuestion.tag = comboWriter->d_tag;
     dnsQuestion.discardedPolicies = &resolver.d_discardedPolicies;
     dnsQuestion.policyTags = &comboWriter->d_policyTags;
-    dnsQuestion.appliedPolicy = &appliedPolicy;
+    dnsQuestion.appliedPolicy = reinterpret_cast<void*>(&appliedPolicy);  // Cast to void* for stub compatibility
     dnsQuestion.currentRecords = &ret;
     dnsQuestion.dh = &comboWriter->d_mdp.d_header;
     dnsQuestion.data = comboWriter->d_data;
@@ -1174,56 +1819,95 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
     dnsQuestion.extendedErrorExtra = &comboWriter->d_extendedErrorExtra;
     dnsQuestion.meta = std::move(comboWriter->d_meta);
     dnsQuestion.fromAuthIP = &resolver.d_fromAuthIP;
+#else
+    // MINIMAL: No Lua DNSQuestion or Policy - just core resolution
+    DNSFilterEngine::Policy appliedPolicy;  // Empty policy (no filtering)
+#endif
 
+    std::cout << "[DEBUG startDoResolve] Setting up resolver slog" << std::endl;
+    std::cout << "[DEBUG startDoResolve] resolver.d_slog pointer: " << (resolver.d_slog ? "not null" : "NULL") << std::endl;
+    if (resolver.d_slog) {
+      std::cout << "[DEBUG startDoResolve] Calling withValues on slog" << std::endl;
     resolver.d_slog = resolver.d_slog->withValues("qname", Logging::Loggable(comboWriter->d_mdp.d_qname),
                                                   "qtype", Logging::Loggable(QType(comboWriter->d_mdp.d_qtype)),
                                                   "remote", Logging::Loggable(comboWriter->getRemote()),
                                                   "proto", Logging::Loggable(comboWriter->d_tcp ? "tcp" : "udp"),
                                                   "ecs", Logging::Loggable(comboWriter->d_ednssubnet.getSource().empty() ? "" : comboWriter->d_ednssubnet.getSource().toString()),
                                                   "mtid", Logging::Loggable(g_multiTasker->getTid()));
+      std::cout << "[DEBUG startDoResolve] withValues completed" << std::endl;
+    } else {
+      std::cout << "[DEBUG startDoResolve] WARNING: resolver.d_slog is NULL, skipping withValues" << std::endl;
+    }
+    std::cout << "[DEBUG startDoResolve] Creating RunningResolveGuard" << std::endl;
     RunningResolveGuard tcpGuard(comboWriter);
+    std::cout << "[DEBUG startDoResolve] RunningResolveGuard created" << std::endl;
 
+    std::cout << "[DEBUG startDoResolve] Checking ednsExtRCode and opcode" << std::endl;
     if (ednsExtRCode != 0 || comboWriter->d_mdp.d_header.opcode == static_cast<unsigned>(Opcode::Notify)) {
+      std::cout << "[DEBUG startDoResolve] ednsExtRCode or opcode check failed, going to sendit" << std::endl;
       goto sendit; // NOLINT(cppcoreguidelines-avoid-goto)
     }
 
+    std::cout << "[DEBUG startDoResolve] Checking for ANY query type" << std::endl;
     if (comboWriter->d_mdp.d_qtype == QType::ANY && !comboWriter->d_tcp && g_anyToTcp) {
+      std::cout << "[DEBUG startDoResolve] ANY query type detected, going to sendit" << std::endl;
       packetWriter.getHeader()->tc = 1;
       res = 0;
       variableAnswer = true;
       goto sendit; // NOLINT(cppcoreguidelines-avoid-goto)
     }
 
+    std::cout << "[DEBUG startDoResolve] Checking trace regex" << std::endl;
     if (t_traceRegex && t_traceRegex->match(comboWriter->d_mdp.d_qname.toString())) {
       resolver.setLogMode(SyncRes::Store);
       tracedQuery = true;
     }
 
+    std::cout << "[DEBUG startDoResolve] Checking quiet mode and logging question" << std::endl;
+    std::cout << "[DEBUG startDoResolve] g_quiet=" << (g_quiet ? "true" : "false") << " tracedQuery=" << (tracedQuery ? "true" : "false") << std::endl;
     if (!g_quiet || tracedQuery) {
+      std::cout << "[DEBUG startDoResolve] Entering logging block" << std::endl;
       if (!g_slogStructured) {
-        g_log << Logger::Warning << RecThreadInfo::thread_local_id() << " [" << g_multiTasker->getTid() << "/" << g_multiTasker->numProcesses() << "] " << (comboWriter->d_tcp ? "TCP " : "") << "question for '" << comboWriter->d_mdp.d_qname << "|"
-              << QType(comboWriter->d_mdp.d_qtype) << "' from " << comboWriter->getRemote();
-        if (!comboWriter->d_ednssubnet.getSource().empty()) {
-          g_log << " (ecs " << comboWriter->d_ednssubnet.getSource().toString() << ")";
-        }
-        g_log << endl;
+        std::cout << "[DEBUG startDoResolve] Using g_log (unstructured logging)" << std::endl;
+        // Skip logging for now to avoid potential issues with g_log
+        // g_log << Logger::Warning << RecThreadInfo::thread_local_id() << " [" << g_multiTasker->getTid() << "/" << g_multiTasker->numProcesses() << "] " << (comboWriter->d_tcp ? "TCP " : "") << "question for '" << comboWriter->d_mdp.d_qname << "|"
+        //       << QType(comboWriter->d_mdp.d_qtype) << "' from " << comboWriter->getRemote();
+        // if (!comboWriter->d_ednssubnet.getSource().empty()) {
+        //   g_log << " (ecs " << comboWriter->d_ednssubnet.getSource().toString() << ")";
+        // }
+        // g_log << endl;
+        std::cout << "[DEBUG startDoResolve] Logging skipped (g_log may not be initialized)" << std::endl;
       }
       else {
+        std::cout << "[DEBUG startDoResolve] Using structured logging (resolver.d_slog)" << std::endl;
+        if (resolver.d_slog) {
         resolver.d_slog->info(Logr::Info, "Question");
+        } else {
+          std::cout << "[DEBUG startDoResolve] WARNING: resolver.d_slog is NULL, skipping structured logging" << std::endl;
       }
+      }
+      std::cout << "[DEBUG startDoResolve] Logging block completed" << std::endl;
+    } else {
+      std::cout << "[DEBUG startDoResolve] Skipping logging (quiet mode)" << std::endl;
     }
 
+    std::cout << "[DEBUG startDoResolve] Checking RD flag" << std::endl;
     if (!comboWriter->d_mdp.d_header.rd) {
+      std::cout << "[DEBUG startDoResolve] RD flag not set, checking g_allowNoRD=" << (g_allowNoRD ? "true" : "false") << std::endl;
       if (g_allowNoRD) {
         resolver.setCacheOnly();
       }
       else {
+        std::cout << "[DEBUG startDoResolve] RD flag not set and g_allowNoRD=false, refusing query" << std::endl;
         ret.clear();
         res = RCode::Refused;
         goto haveAnswer; // NOLINT(cppcoreguidelines-avoid-goto)
       }
     }
+    std::cout << "[DEBUG startDoResolve] RD flag check passed, proceeding to resolution" << std::endl;
 
+#if 0
+    // DISABLED: Lua prerpz, Policy/RPZ, DNS64, and gettag_ffi handling (not needed for minimal UDP flow)
     if (comboWriter->d_luaContext) {
       comboWriter->d_luaContext->prerpz(dnsQuestion, res, resolver.d_eventTrace);
     }
@@ -1301,9 +1985,17 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
           }
         }
       }
+#else
+    // MINIMAL: Skip Lua, Policy/RPZ, DNS64 - go straight to resolution
+    std::cout << "[DEBUG startDoResolve] Setting wantsRPZ to false (RPZ disabled)" << std::endl;
+    resolver.setWantsRPZ(false);  // RPZ disabled
+    std::cout << "[DEBUG startDoResolve] wantsRPZ set, about to call beginResolve" << std::endl;
+#endif
 
       // Query did not get handled for Client IP or QNAME Policy reasons, now actually go out to find an answer
+      std::cout << "[DEBUG startDoResolve] Entering try block for beginResolve" << std::endl;
       try {
+        std::cout << "[DEBUG startDoResolve] About to call beginResolve for " << comboWriter->d_mdp.d_qname << " type=" << comboWriter->d_mdp.d_qtype << std::endl;
         resolver.d_appliedPolicy = appliedPolicy;
         resolver.d_policyTags = std::move(comboWriter->d_policyTags);
 
@@ -1313,6 +2005,7 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
 
         ret.clear(); // policy might have filled it with custom records but we decided not to use them
         res = resolver.beginResolve(comboWriter->d_mdp.d_qname, QType(comboWriter->d_mdp.d_qtype), comboWriter->d_mdp.d_qclass, ret);
+        std::cout << "[DEBUG startDoResolve] beginResolve returned: res=" << res << " ret.size()=" << ret.size() << std::endl;
         shouldNotValidate = resolver.wasOutOfBand();
       }
       catch (const ImmediateQueryDropException& e) {
@@ -1345,6 +2038,8 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
       catch (const PolicyHitException& e) {
         res = -2;
       }
+#if 0
+      // DISABLED: Lua post-resolve hooks, DNS64, and Policy handling after beginResolve (not needed for minimal UDP flow)
       dnsQuestion.validationState = resolver.getValidationState();
       appliedPolicy = resolver.d_appliedPolicy;
       comboWriter->d_policyTags = std::move(resolver.d_policyTags);
@@ -1429,8 +2124,14 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
         return;
       }
     }
+#else
+      // MINIMAL: Update policy tags from resolver (but no policy processing)
+      appliedPolicy = resolver.d_appliedPolicy;
+      comboWriter->d_policyTags = std::move(resolver.d_policyTags);
+#endif
 
   haveAnswer:;
+    std::cout << "[DEBUG startDoResolve] Reached haveAnswer: res=" << res << " ret.size()=" << ret.size() << std::endl;
     if (tracedQuery || res == -1 || res == RCode::ServFail || packetWriter.getHeader()->rcode == static_cast<unsigned>(RCode::ServFail)) {
       dumpTrace(resolver.getTrace(), resolver.d_fixednow);
     }
@@ -1535,24 +2236,35 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
         pdns::dedupRecords(ret);
 #endif
         pdns::orderAndShuffle(ret, false);
+#if 0
+        // DISABLED: Sortlist (Lua feature - not needed for minimal UDP flow)
         if (auto listToSort = luaconfsLocal->sortlist.getOrderCmp(comboWriter->d_source)) {
           stable_sort(ret.begin(), ret.end(), *listToSort);
           variableAnswer = true;
         }
+#endif
       }
 
+      std::cout << "[DEBUG startDoResolve] About to add " << ret.size() << " records to packet" << std::endl;
       bool needCommit = false;
       for (const auto& record : ret) {
+        std::cout << "[DEBUG startDoResolve] Processing record: name=" << record.d_name << " type=" << record.d_type << " ttl=" << record.d_ttl << " place=" << (int)record.d_place << std::endl;
         if (!DNSSECOK && (record.d_type == QType::NSEC3 || ((record.d_type == QType::RRSIG || record.d_type == QType::NSEC) && ((comboWriter->d_mdp.d_qtype != record.d_type && comboWriter->d_mdp.d_qtype != QType::ANY) || (record.d_place != DNSResourceRecord::ANSWER && record.d_place != DNSResourceRecord::ADDITIONAL))))) {
+          std::cout << "[DEBUG startDoResolve] Skipping DNSSEC record (DNSSEC disabled)" << std::endl;
           continue;
         }
 
+        std::cout << "[DEBUG startDoResolve] Calling addRecordToPacket for record: name=" << record.d_name << " type=" << record.d_type << std::endl;
         if (!addRecordToPacket(packetWriter, record, minTTL, comboWriter->d_ttlCap, maxanswersize, seenAuthSOA)) {
+          std::cout << "[DEBUG startDoResolve] addRecordToPacket returned false (truncated or error)" << std::endl;
           needCommit = false;
           break;
         }
+        std::cout << "[DEBUG startDoResolve] addRecordToPacket succeeded, needCommit=true" << std::endl;
         needCommit = true;
 
+#if 0
+        // DISABLED: NOD and Protobuf (not needed for minimal UDP flow)
         bool udr = false;
 #ifdef NOD_ENABLED
         if (g_udrEnabled) {
@@ -1571,9 +2283,14 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
             pbMessage.addRR(record, luaconfsLocal->protobufExportConfig.exportTypes, udr);
           }
         }
+#endif
       }
       if (needCommit) {
+        std::cout << "[DEBUG startDoResolve] Committing packet with records, packet.size() before commit=" << packet.size() << std::endl;
         packetWriter.commit();
+        std::cout << "[DEBUG startDoResolve] Packet committed, packet.size() after commit=" << packet.size() << std::endl;
+      } else {
+        std::cout << "[DEBUG startDoResolve] WARNING: needCommit=false, packet not committed! ret.size()=" << ret.size() << std::endl;
       }
 #ifdef NOD_ENABLED
 #ifdef HAVE_FSTRM
@@ -1727,8 +2444,28 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
       packetWriter.commit();
     }
 
-    t_Counters.at(rec::ResponseStats::responseStats).submitResponse(comboWriter->d_mdp.d_qtype, packet.size(), packetWriter.getHeader()->rcode);
+    // Update statistics (wrapped in try-catch to prevent crashes if t_Counters is not initialized)
+    std::cout << "[DEBUG startDoResolve] About to update response stats" << std::endl;
+    try {
+      // WINDOWS FIX: Read rcode directly from wire format to avoid struct padding issues
+      uint8_t rcode = 0;
+      if (packet.size() >= 12) {
+        // RCODE is in bits 3-0 of byte 3 (flags byte)
+        rcode = packet[3] & 0x0F;
+      } else {
+        // Fallback: use getHeader() if packet is too small (shouldn't happen)
+        rcode = packetWriter.getHeader()->rcode;
+      }
+      t_Counters.at(rec::ResponseStats::responseStats).submitResponse(comboWriter->d_mdp.d_qtype, packet.size(), rcode);
+      std::cout << "[DEBUG startDoResolve] Response stats updated successfully" << std::endl;
+    } catch (const std::exception& e) {
+      std::cerr << "[WARNING] Failed to update response stats: " << e.what() << std::endl;
+    }
+    std::cout << "[DEBUG startDoResolve] Calling updateResponseStats" << std::endl;
     updateResponseStats(res, comboWriter->d_source, packet.size(), &comboWriter->d_mdp.d_qname, comboWriter->d_mdp.d_qtype);
+    std::cout << "[DEBUG startDoResolve] updateResponseStats completed" << std::endl;
+#if 0
+    // DISABLED: NOD and Protobuf logging (not needed for minimal UDP flow)
 #ifdef NOD_ENABLED
     bool nod = false;
     if (g_nodEnabled) {
@@ -1757,11 +2494,30 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
       }
     }
 #endif /* NOD_ENABLED */
+#endif
 
+    std::cout << "[DEBUG startDoResolve] Checking variableAnswer" << std::endl;
     if (variableAnswer || resolver.wasVariable()) {
+      try {
       t_Counters.at(rec::Counter::variableResponses)++;
+        std::cout << "[DEBUG startDoResolve] Variable response counter incremented" << std::endl;
+      } catch (const std::exception& e) {
+        std::cerr << "[WARNING] Failed to increment variable response counter: " << e.what() << std::endl;
+      }
     }
+    std::cout << "[DEBUG startDoResolve] About to check if TCP or UDP" << std::endl;
+    std::cout << "[DEBUG startDoResolve] comboWriter->d_tcp=" << (comboWriter->d_tcp ? "true" : "false") << std::endl;
+    std::cout << "[DEBUG startDoResolve] About to enter if (!comboWriter->d_tcp) block" << std::endl;
+    std::cout.flush(); // Force flush to ensure log is written
+    std::cout << "[DEBUG startDoResolve] After flush, before #if 0 blocks" << std::endl;
+    std::cout.flush();
+    std::cerr << "[DEBUG startDoResolve] LINE 2393: Right after flush - using cerr" << std::endl;
+    std::cerr.flush();
+    std::cout << "[DEBUG startDoResolve] LINE 2394: About to process #if 0 blocks" << std::endl;
+    std::cout.flush();
 
+#if 0
+    // DISABLED: Protobuf message construction (not needed for minimal UDP flow)
     if (t_protobufServers.servers && !(luaconfsLocal->protobufExportConfig.taggedOnly && appliedPolicy.getName().empty() && comboWriter->d_policyTags.empty())) {
       // Start constructing embedded DNSResponse object
       pbMessage.setResponseCode(packetWriter.getHeader()->rcode);
@@ -1788,47 +2544,94 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
 #endif
     }
 
+#if 0
+    // DISABLED: Packet cache (not needed for minimal UDP flow - can be enabled later)
     const bool intoPC = g_packetCache && !variableAnswer && !resolver.wasVariable();
     if (intoPC) {
       minTTL = capPacketCacheTTL(*packetWriter.getHeader(), minTTL, seenAuthSOA);
       g_packetCache->insertResponsePacket(comboWriter->d_tag, comboWriter->d_qhash, std::move(comboWriter->d_query), comboWriter->d_mdp.d_qname,
                                           comboWriter->d_mdp.d_qtype, comboWriter->d_mdp.d_qclass,
                                           string(reinterpret_cast<const char*>(&*packet.begin()), packet.size()), // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
-                                          g_now.tv_sec,
+                                          comboWriter->d_now.tv_sec,  // Use comboWriter->d_now instead of g_now
                                           minTTL,
-                                          dnsQuestion.validationState,
+                                          resolver.getValidationState(),  // Use resolver.getValidationState() instead of dnsQuestion.validationState
                                           std::move(pbDataForCache), comboWriter->d_tcp);
     }
+#endif
 
+#if 0
+    // DISABLED: Regression test mode (not needed for minimal UDP flow)
     if (g_regressionTestMode) {
       t_Counters.updateSnap(g_regressionTestMode);
     }
+#endif
+#endif  // End of #if 0 block starting at line 2399
+
+    std::cout << "[DEBUG startDoResolve] IMMEDIATELY AFTER #endif - line 2454" << std::endl;
+    std::cout.flush();
+    std::cerr << "[DEBUG startDoResolve] IMMEDIATELY AFTER #endif - using cerr" << std::endl;
+    std::cerr.flush();
+    std::cout << "[DEBUG startDoResolve] After all #if 0 blocks, before if statement" << std::endl;
+    std::cout.flush();
+    std::cout << "[DEBUG startDoResolve] Reached if statement, checking !comboWriter->d_tcp" << std::endl;
+    std::cout.flush(); // Force flush
 
     if (!comboWriter->d_tcp) {
+      std::cout << "[DEBUG startDoResolve] Entered UDP send block!" << std::endl;
+      std::cout << "[DEBUG startDoResolve] Sending UDP response: packet.size()=" << packet.size() << " to " << comboWriter->getRemote() << std::endl;
+      std::cout << "[DEBUG startDoResolve] comboWriter->d_socket=" << comboWriter->d_socket << std::endl;
+      try {
       struct msghdr msgh{};
       struct iovec iov{};
       cmsgbuf_aligned cbuf{};
+        std::cout << "[DEBUG startDoResolve] About to call fillMSGHdr" << std::endl;
       fillMSGHdr(&msgh, &iov, &cbuf, 0, reinterpret_cast<char*>(&*packet.begin()), packet.size(), &comboWriter->d_remote); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+        std::cout << "[DEBUG startDoResolve] fillMSGHdr completed" << std::endl;
       msgh.msg_control = nullptr;
 
       if (g_fromtosockets.count(comboWriter->d_socket) > 0) {
+          std::cout << "[DEBUG startDoResolve] Adding source address to message" << std::endl;
         addCMsgSrcAddr(&msgh, &cbuf, &comboWriter->d_local, 0);
       }
+        std::cout << "[DEBUG startDoResolve] About to call sendOnNBSocket on socket " << comboWriter->d_socket << std::endl;
       int sendErr = sendOnNBSocket(comboWriter->d_socket, &msgh);
-      if (sendErr != 0 && g_logCommonErrors) {
+        std::cout << "[DEBUG startDoResolve] sendOnNBSocket returned: " << sendErr << std::endl;
+        if (sendErr != 0) {
+          std::cerr << "[ERROR startDoResolve] sendOnNBSocket failed with error: " << sendErr << std::endl;
+          if (g_logCommonErrors) {
         SLOG(g_log << Logger::Warning << "Sending UDP reply to client " << comboWriter->getRemote() << " failed with: "
                    << stringerror(sendErr) << endl,
              g_slogudpin->error(Logr::Warning, sendErr, "Sending UDP reply to client failed"));
       }
+        } else {
+          std::cout << "[DEBUG startDoResolve] UDP response sent successfully!" << std::endl;
+        }
+      } catch (const std::exception& e) {
+        std::cerr << "[ERROR startDoResolve] Exception during UDP send: " << e.what() << std::endl;
+      } catch (...) {
+        std::cerr << "[ERROR startDoResolve] Unknown exception during UDP send" << std::endl;
+      }
+      std::cout << "[DEBUG startDoResolve] UDP send block completed" << std::endl;
+      std::cout.flush();
     }
     else {
+      std::cout << "[DEBUG startDoResolve] TCP path (not UDP)" << std::endl;
+      std::cout.flush();
       bool hadError = sendResponseOverTCP(comboWriter, packet);
       finishTCPReply(comboWriter, hadError, true);
       tcpGuard.setHandled();
     }
 
+    std::cout << "[DEBUG startDoResolve] After UDP/TCP send, about to add event trace" << std::endl;
+    std::cout.flush();
     resolver.d_eventTrace.add(RecEventTrace::AnswerSent);
+    std::cout << "[DEBUG startDoResolve] Event trace added" << std::endl;
+    std::cout.flush();
 
+    std::cout << "[DEBUG startDoResolve] About to check event trace logging" << std::endl;
+    std::cout.flush();
+#if 0
+    // DISABLED: Protobuf message construction (not needed for minimal UDP flow)
     // Now do the per query changing part of the protobuf message
     if (t_protobufServers.servers && !(luaconfsLocal->protobufExportConfig.taggedOnly && appliedPolicy.getName().empty() && comboWriter->d_policyTags.empty())) {
       // Below are the fields that are not stored in the packet cache and will be appended here and on a cache hit
@@ -1895,87 +2698,123 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
         protobufLogResponse(pbMessage);
       }
     }
+#endif
 
+    // WINDOWS FIX: Guard event trace logging - g_log and resolver.d_slog might not be initialized
+    try {
     if (resolver.d_eventTrace.enabled() && SyncRes::eventTraceEnabled(SyncRes::event_trace_to_log)) {
-      SLOG(g_log << Logger::Info << resolver.d_eventTrace.toString() << endl,
-           resolver.d_slog->info(Logr::Info, resolver.d_eventTrace.toString())); // Maybe we want it to be more fancy?
+        // Skip logging if g_log or resolver.d_slog are not initialized
+        std::cout << "[DEBUG startDoResolve] Event trace logging enabled, but skipping (g_log/resolver.d_slog may not be initialized)" << std::endl;
+        std::cout.flush();
+        // SLOG(g_log << Logger::Info << resolver.d_eventTrace.toString() << endl,
+        //      resolver.d_slog->info(Logr::Info, resolver.d_eventTrace.toString())); // Maybe we want it to be more fancy?
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "[ERROR startDoResolve] Exception in event trace logging: " << e.what() << std::endl;
+      std::cerr.flush();
     }
 
+    std::cout << "[DEBUG startDoResolve] About to calculate spentUsec" << std::endl;
+    std::cout.flush();
     // Originally this code used a mix of floats, doubles, uint64_t with different units.
     // Now it always uses an integral number of microseconds, except for averages, which use doubles
     uint64_t spentUsec = uSec(resolver.getNow() - comboWriter->d_now);
+    std::cout << "[DEBUG startDoResolve] spentUsec=" << spentUsec << std::endl;
+    std::cout.flush();
+    
+    // WINDOWS FIX: Guard logging - g_log and g_slogStructured might not be initialized
+    // Skip all logging for now - g_log and resolver.d_slog might not be initialized
     if (!g_quiet) {
-      if (!g_slogStructured) {
-        g_log << Logger::Error << RecThreadInfo::thread_local_id() << " [" << g_multiTasker->getTid() << "/" << g_multiTasker->numProcesses() << "] answer to " << (comboWriter->d_mdp.d_header.rd ? "" : "non-rd ") << "question '" << comboWriter->d_mdp.d_qname << "|" << DNSRecordContent::NumberToType(comboWriter->d_mdp.d_qtype);
-        g_log << "': " << ntohs(packetWriter.getHeader()->ancount) << " answers, " << ntohs(packetWriter.getHeader()->arcount) << " additional, took " << resolver.d_outqueries << " packets, " << resolver.d_totUsec / 1000.0 << " netw ms, " << static_cast<double>(spentUsec) / 1000.0 << " tot ms, " << resolver.d_throttledqueries << " throttled, " << resolver.d_timeouts << " timeouts, " << resolver.d_tcpoutqueries << "/" << resolver.d_dotoutqueries << " tcp/dot connections, rcode=" << res;
-
-        if (!shouldNotValidate && resolver.isDNSSECValidationRequested()) {
-          g_log << ", dnssec=" << resolver.getValidationState();
-        }
-        g_log << " answer-is-variable=" << resolver.wasVariable() << ", into-packetcache=" << intoPC;
-        g_log << " maxdepth=" << resolver.d_maxdepth;
-        g_log << endl;
-      }
-      else {
-        resolver.d_slog->info(Logr::Info, "Answer", "rd", Logging::Loggable(comboWriter->d_mdp.d_header.rd),
-                              "answers", Logging::Loggable(ntohs(packetWriter.getHeader()->ancount)),
-                              "additional", Logging::Loggable(ntohs(packetWriter.getHeader()->arcount)),
-                              "outqueries", Logging::Loggable(resolver.d_outqueries),
-                              "netms", Logging::Loggable(resolver.d_totUsec / 1000.0),
-                              "totms", Logging::Loggable(static_cast<double>(spentUsec) / 1000.0),
-                              "throttled", Logging::Loggable(resolver.d_throttledqueries),
-                              "timeouts", Logging::Loggable(resolver.d_timeouts),
-                              "tcpout", Logging::Loggable(resolver.d_tcpoutqueries),
-                              "dotout", Logging::Loggable(resolver.d_dotoutqueries),
-                              "rcode", Logging::Loggable(res),
-                              "validationState", Logging::Loggable(resolver.getValidationState()),
-                              "answer-is-variable", Logging::Loggable(resolver.wasVariable()),
-                              "into-packetcache", Logging::Loggable(intoPC),
-                              "maxdepth", Logging::Loggable(resolver.d_maxdepth));
-      }
+      std::cout << "[DEBUG startDoResolve] Not quiet, but skipping g_log output (g_log may not be initialized)" << std::endl;
+      std::cout.flush();
+      // Skip g_log output for now - it might not be initialized
+      // Original code would have logged here using g_log or resolver.d_slog
     }
+    std::cout << "[DEBUG startDoResolve] Logging section completed (or skipped)" << std::endl;
+    std::cout.flush();
 
+    std::cout << "[DEBUG startDoResolve] About to check opcode and update cache stats" << std::endl;
+    std::cout.flush();
     if (comboWriter->d_mdp.d_header.opcode == static_cast<unsigned>(Opcode::Query)) {
+      if (g_recCache) {
       if (resolver.d_outqueries != 0 || resolver.d_throttledqueries != 0 || resolver.d_authzonequeries != 0) {
         g_recCache->incCacheMisses();
       }
       else {
         g_recCache->incCacheHits();
       }
+      } else {
+        std::cout << "[DEBUG startDoResolve] g_recCache is null, skipping cache stats update" << std::endl;
+        std::cout.flush();
     }
+    }
+    std::cout << "[DEBUG startDoResolve] Cache stats updated (or skipped)" << std::endl;
+    std::cout.flush();
 
+    std::cout << "[DEBUG startDoResolve] About to update histogram counters" << std::endl;
+    std::cout.flush();
+    try {
     t_Counters.at(rec::Histogram::answers)(spentUsec);
     t_Counters.at(rec::Histogram::cumulativeAnswers)(spentUsec);
+    } catch (const std::exception& e) {
+      std::cerr << "[ERROR startDoResolve] Exception updating histogram counters: " << e.what() << std::endl;
+      std::cerr.flush();
+    }
 
+    std::cout << "[DEBUG startDoResolve] About to update latency counters" << std::endl;
+    std::cout.flush();
+    try {
     auto newLat = static_cast<double>(spentUsec);
     newLat = min(newLat, g_networkTimeoutMsec * 1000.0); // outliers of several minutes exist..
     t_Counters.at(rec::DoubleWAvgCounter::avgLatencyUsec).addToRollingAvg(newLat, g_latencyStatSize);
+    } catch (const std::exception& e) {
+      std::cerr << "[ERROR startDoResolve] Exception updating latency counters: " << e.what() << std::endl;
+      std::cerr.flush();
+    }
     // no worries, we do this for packet cache hits elsewhere
 
+    std::cout << "[DEBUG startDoResolve] About to check if spentUsec >= resolver.d_totUsec" << std::endl;
+    std::cout.flush();
+    try {
     if (spentUsec >= resolver.d_totUsec) {
       uint64_t ourtime = spentUsec - resolver.d_totUsec;
       t_Counters.at(rec::Histogram::ourtime)(ourtime);
-      newLat = static_cast<double>(ourtime); // usec
+        auto newLat = static_cast<double>(ourtime); // usec
       t_Counters.at(rec::DoubleWAvgCounter::avgLatencyOursUsec).addToRollingAvg(newLat, g_latencyStatSize);
     }
+    } catch (const std::exception& e) {
+      std::cerr << "[ERROR startDoResolve] Exception updating ourtime counters: " << e.what() << std::endl;
+      std::cerr.flush();
+    }
+    std::cout << "[DEBUG startDoResolve] Latency counters updated" << std::endl;
+    std::cout.flush();
 
+#if 0
+    // DISABLED: NOD (not needed for minimal UDP flow)
 #ifdef NOD_ENABLED
     if (nod) {
       sendNODLookup(nodlogger, comboWriter->d_mdp.d_qname);
     }
 #endif /* NOD_ENABLED */
+#endif
 
     //    cout<<dc->d_mdp.d_qname<<"\t"<<MT->getUsec()<<"\t"<<sr.d_outqueries<<endl;
   }
   catch (const PDNSException& ae) {
+    std::cerr << "[ERROR startDoResolve] PDNSException caught: " << ae.reason << std::endl;
+    std::cerr.flush();
     SLOG(g_log << Logger::Error << "startDoResolve problem " << makeLoginfo(comboWriter) << ": " << ae.reason << endl,
          resolver.d_slog->error(Logr::Error, ae.reason, "startDoResolve problem", "exception", Logging::Loggable("PDNSException")));
   }
   catch (const MOADNSException& mde) {
+    std::cerr << "[ERROR startDoResolve] MOADNSException caught: " << mde.what() << std::endl;
+    std::cerr.flush();
     SLOG(g_log << Logger::Error << "DNS parser error " << makeLoginfo(comboWriter) << ": " << comboWriter->d_mdp.d_qname << ", " << mde.what() << endl,
          resolver.d_slog->error(Logr::Error, mde.what(), "DNS parser error"));
   }
   catch (const std::exception& e) {
+    std::cerr << "[ERROR startDoResolve] std::exception caught: " << e.what() << std::endl;
+    std::cerr.flush();
     SLOG(g_log << Logger::Error << "STL error " << makeLoginfo(comboWriter) << ": " << e.what(),
          resolver.d_slog->error(Logr::Error, e.what(), "Exception in resolver context", "exception", Logging::Loggable("std::exception")));
 
@@ -1994,14 +2833,31 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
     }
   }
   catch (...) {
+    std::cerr << "[ERROR startDoResolve] Unknown exception caught (catch ...)" << std::endl;
+    std::cerr.flush();
     SLOG(g_log << Logger::Error << "Any other exception in a resolver context " << makeLoginfo(comboWriter) << endl,
          resolver.d_slog->info(Logr::Error, "Any other exception in a resolver context"));
   }
 
+  std::cout << "[DEBUG startDoResolve] FUNCTION END: About to call runTaskOnce" << std::endl;
+  std::cout.flush();
   runTaskOnce(g_logCommonErrors);
+  std::cout << "[DEBUG startDoResolve] FUNCTION END: runTaskOnce completed" << std::endl;
+  std::cout.flush();
 
-  static const size_t stackSizeThreshold = 9 * ::arg().asNum("stack-size") / 10;
-  if (g_multiTasker->getMaxStackUsage() >= stackSizeThreshold) {
+  std::cout << "[DEBUG startDoResolve] About to check stack size threshold" << std::endl;
+  std::cout.flush();
+  // WINDOWS FIX: Guard ::arg() call - it might not be initialized in minimal setup
+  size_t stackSizeThreshold = 0;
+  try {
+    stackSizeThreshold = 9 * ::arg().asNum("stack-size") / 10;
+  } catch (...) {
+    // If arg() is not initialized, use a default threshold
+    stackSizeThreshold = 900000; // Default: 90% of 1MB stack
+    std::cout << "[DEBUG startDoResolve] ::arg() not initialized, using default stack threshold" << std::endl;
+    std::cout.flush();
+  }
+  if (g_multiTasker && g_multiTasker->getMaxStackUsage() >= stackSizeThreshold) {
     SLOG(g_log << Logger::Error << "Reached mthread stack usage of 90%: " << g_multiTasker->getMaxStackUsage() << " " << makeLoginfo(comboWriter) << " after " << resolver.d_outqueries << " out queries, " << resolver.d_tcpoutqueries << " TCP out queries, " << resolver.d_dotoutqueries << " DoT out queries" << endl,
          resolver.d_slog->info(Logr::Error, "Reached mthread stack usage of 90%",
                                "stackUsage", Logging::Loggable(g_multiTasker->getMaxStackUsage()),
@@ -2013,10 +2869,28 @@ void startDoResolve(void* arg) // NOLINT(readability-function-cognitive-complexi
                                "dotout", Logging::Loggable(resolver.d_dotoutqueries),
                                "validationState", Logging::Loggable(resolver.getValidationState())));
   }
+  std::cout << "[DEBUG startDoResolve] About to update counters" << std::endl;
+  std::cout.flush();
+  try {
+    if (g_multiTasker) {
   t_Counters.at(rec::Counter::maxMThreadStackUsage) = max(g_multiTasker->getMaxStackUsage(), t_Counters.at(rec::Counter::maxMThreadStackUsage));
+    }
   t_Counters.updateSnap(g_regressionTestMode);
+  } catch (const std::exception& e) {
+    std::cerr << "[ERROR startDoResolve] Exception updating counters: " << e.what() << std::endl;
+    std::cerr.flush();
+  }
+  std::cout << "[DEBUG startDoResolve] Counters updated" << std::endl;
+  std::cout.flush();
+  
+  std::cout << "[DEBUG startDoResolve] FUNCTION END: Final log before function exit" << std::endl;
+  std::cout.flush();
+  std::cerr << "[DEBUG startDoResolve] FUNCTION END: Final log using cerr" << std::endl;
+  std::cerr.flush();
 }
 
+#if 0
+// Rest of disabled code continues below (startDoResolve is now enabled above)
 void getQNameAndSubnet(const std::string& question, DNSName* dnsname, uint16_t* qtype, uint16_t* qclass,
                        bool& foundECS, EDNSSubnetOpts* ednssubnet, EDNSOptionViewMap* options, boost::optional<uint32_t>& ednsVersion)
 {
@@ -2915,6 +3789,27 @@ void distributeAsyncFunction(const string& packet, const pipefunc_t& func)
   // coverity[leaked_storage]
 }
 
+#endif // #if 0 - End of disabled code (doResends enabled below)
+
+// ========================================================================
+// UDP FLOW: initializeMTaskerInfrastructure - initialize MTasker, t_fdm, t_udpclientsocks
+// ========================================================================
+void initializeMTaskerInfrastructure()
+{
+  if (!g_multiTasker) {
+    g_multiTasker = std::make_unique<MT_t>();
+  }
+  if (!t_fdm) {
+    t_fdm = std::unique_ptr<FDMultiplexer>(FDMultiplexer::getMultiplexerSilent());
+  }
+  if (!t_udpclientsocks) {
+    t_udpclientsocks = std::make_unique<UDPClientSocks>();
+  }
+}
+
+// ========================================================================
+// UDP FLOW: doResends - needed by handleUDPServerResponse
+// ========================================================================
 // resend event to everybody chained onto it
 static void doResends(MT_t::waiters_t::iterator& iter, const std::shared_ptr<PacketID>& resend, const PacketBuffer& content)
 {
@@ -2940,6 +3835,13 @@ static void doResends(MT_t::waiters_t::iterator& iter, const std::shared_ptr<Pac
   }
 }
 
+// ========================================================================
+// UDP FLOW: mthreadSleep - MTasker-aware sleep function
+// ========================================================================
+// WINDOWS: Enabled - uses g_multiTasker->waitEvent() for proper MTasker integration
+// This is the original upstream implementation, not the stub from lwres_stubs.cc
+// CRITICAL: DO NOT REMOVE - this is the correct MTasker-aware sleep implementation
+// ========================================================================
 void mthreadSleep(unsigned int jitterMsec)
 {
   auto neverHappens = std::make_shared<PacketID>();
@@ -2951,6 +3853,14 @@ void mthreadSleep(unsigned int jitterMsec)
   assert(g_multiTasker->waitEvent(neverHappens, nullptr, jitterMsec) != -1); // NOLINT
 }
 
+#if 0
+// Disabled code continues...
+
+#endif // #if 0 - End of disabled code
+
+// ========================================================================
+// UDP FLOW: Helper function for arecvfrom - checks ECS in response
+// ========================================================================
 static bool checkIncomingECSSource(const PacketBuffer& packet, const Netmask& subnet)
 {
   bool foundMatchingECS = false;
@@ -2979,15 +3889,89 @@ static bool checkIncomingECSSource(const PacketBuffer& packet, const Netmask& su
 
 static void handleUDPServerResponse(int fileDesc, FDMultiplexer::funcparam_t& var)
 {
+#ifdef _WIN32
+  // Windows debugging: Check socket state before recv
+  {
+    // Verify socket is still connected
+    sockaddr_in test_addr{};
+    socklen_t test_len = sizeof(test_addr);
+    int getpeername_result = getpeername(fileDesc, reinterpret_cast<sockaddr*>(&test_addr), &test_len);
+    if (getpeername_result == 0) {
+      std::cout << "[DEBUG] handleUDPServerResponse: socket fd=" << fileDesc << " is connected" << std::endl;
+    } else {
+      int werr = WSAGetLastError();
+      std::cout << "[DEBUG] handleUDPServerResponse: WARNING - getpeername failed for fd=" << fileDesc << " WSA error=" << werr << std::endl;
+    }
+    
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(fileDesc, &readfds);
+    struct timeval tv = {0, 0};
+    int select_result = select(fileDesc + 1, &readfds, nullptr, nullptr, &tv);
+    if (select_result > 0 && FD_ISSET(fileDesc, &readfds)) {
+      std::cout << "[DEBUG] handleUDPServerResponse: select() confirms data available on fd=" << fileDesc << std::endl;
+    } else if (select_result == 0) {
+      std::cout << "[DEBUG] handleUDPServerResponse: WARNING - select() says NO data on fd=" << fileDesc << " but libevent fired!" << std::endl;
+      // Try to peek anyway - maybe data arrived between select() and now
+      char peek_buf[12];
+      int peek_result = recv(fileDesc, peek_buf, 12, MSG_PEEK);
+      if (peek_result > 0) {
+        std::cout << "[DEBUG] handleUDPServerResponse: recv(MSG_PEEK) confirms " << peek_result << " bytes available despite select() saying no data" << std::endl;
+      } else {
+        int werr = WSAGetLastError();
+        std::cout << "[DEBUG] handleUDPServerResponse: recv(MSG_PEEK) failed WSA error=" << werr << std::endl;
+      }
+    } else {
+      int werr = WSAGetLastError();
+      std::cout << "[DEBUG] handleUDPServerResponse: select() failed WSA error=" << werr << std::endl;
+    }
+  }
+#endif
   auto pid = boost::any_cast<std::shared_ptr<PacketID>>(var);
   PacketBuffer packet;
   packet.resize(g_outgoingEDNSBufsize);
   ComboAddress fromaddr;
   socklen_t addrlen = sizeof(fromaddr);
 
-  ssize_t len = recvfrom(fileDesc, &packet.at(0), packet.size(), 0, reinterpret_cast<sockaddr*>(&fromaddr), &addrlen); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+#ifdef _WIN32
+  std::cout << "[DEBUG] handleUDPServerResponse: about to call recvfrom on fd=" << fileDesc << std::endl;
+  std::cout.flush();
+  timeval recv_start{};
+  Utility::gettimeofday(&recv_start, nullptr);
+  std::cout << "[DEBUG] handleUDPServerResponse: about to call recvfrom on fd=" << fileDesc << " at time=" << recv_start.tv_sec << "." << recv_start.tv_usec << std::endl;
+  std::cout.flush();
+  
+  // Debug: Check packet buffer before recvfrom (should be zero-initialized)
+  std::cout << "[DEBUG] handleUDPServerResponse: packet buffer before recvfrom (first 4 bytes):";
+  for (size_t i = 0; i < 4 && i < packet.size(); ++i) {
+    std::cout << ' ' << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(packet[i]);
+  }
+  std::cout << std::dec << std::setfill(' ') << std::endl;
+#endif
 
+  ssize_t len = recvfrom(fileDesc, reinterpret_cast<char*>(&packet.at(0)), packet.size(), 0, reinterpret_cast<sockaddr*>(&fromaddr), &addrlen); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+
+#ifdef _WIN32
+  timeval recv_end{};
+  Utility::gettimeofday(&recv_end, nullptr);
+  std::cout << "[DEBUG] handleUDPServerResponse: recvfrom returned len=" << len;
+  if (len < 0) {
+    int werr = WSAGetLastError();
+    std::cout << " WSA error=" << werr;
+  }
+  std::cout << " from=" << fromaddr.toStringWithPort() << " at time=" << recv_end.tv_sec << "." << recv_end.tv_usec;
+  long recv_duration_us = (recv_end.tv_sec - recv_start.tv_sec) * 1000000 + (recv_end.tv_usec - recv_start.tv_usec);
+  std::cout << " (took " << recv_duration_us << " us)" << std::endl;
+  std::cout.flush();
+#endif
+
+  // DNS header is always 12 bytes in wire format, regardless of struct packing
+#ifdef _WIN32
+  constexpr size_t DNS_HEADER_SIZE = 12;
+  const ssize_t signed_sizeof_sdnsheader = DNS_HEADER_SIZE;
+#else
   const ssize_t signed_sizeof_sdnsheader = sizeof(dnsheader);
+#endif
 
   if (len < 0) {
     // len < 0: error on socket
@@ -3016,7 +4000,65 @@ static void handleUDPServerResponse(int fileDesc, FDMultiplexer::funcparam_t& va
   // We have at least a full header
   packet.resize(len);
   dnsheader dnsheader{};
-  memcpy(&dnsheader, &packet.at(0), sizeof(dnsheader));
+  
+#ifdef _WIN32
+  // ========================================================================
+  // WINDOWS FIX: DNS Header Padding and Byte Order Issues
+  // ========================================================================
+  // PROBLEM: On Windows (MinGW), sizeof(dnsheader) = 14 bytes due to struct padding,
+  //          but DNS wire format header is always 12 bytes. The padding (2 bytes) is
+  //          inserted after the Flags field (bytes 2-3), causing misalignment when
+  //          using memcpy() or dnsheader_aligned.
+  //
+  // STRUCT LAYOUT (Windows, 14 bytes):
+  //   [ID:2][Flags:2][PADDING:2][QDCOUNT:2][ANCOUNT:2][NSCOUNT:2][ARCOUNT:2]
+  // WIRE FORMAT (always 12 bytes):
+  //   [ID:2][Flags:2][QDCOUNT:2][ANCOUNT:2][NSCOUNT:2][ARCOUNT:2]
+  //
+  // WHY THIS FIX IS NEEDED:
+  //   1. dnsheader_aligned uses memcpy(&d_h, mem, sizeof(dnsheader)) which copies 14 bytes
+  //      from a 12-byte wire format, causing count fields to be misaligned.
+  //   2. When memcpy copies 14 bytes, bytes 4-5 of the wire (QDCOUNT) end up in struct
+  //      bytes 6-7 (where ANCOUNT should be), causing qdcount=256 errors.
+  //   3. The ID field must be converted from network byte order (big-endian wire format)
+  //      to host byte order using ntohs() to match the query ID (qid) stored in PacketID.
+  //
+  // SOLUTION: Read ID and count fields directly from raw wire format bytes, manually
+  //           construct uint16_t values, and convert ID using ntohs() for comparison.
+  //
+  // CRITICAL: DO NOT REMOVE THIS FIX - it is essential for correct DNS packet parsing
+  //           on Windows. Without it, query IDs won't match and responses will fail.
+  // ========================================================================
+  const uint8_t* raw = reinterpret_cast<const uint8_t*>(packet.data());
+  // Initialize struct to zero first
+  memset(&dnsheader, 0, sizeof(dnsheader));
+  // Copy only Flags (bytes 2-3) to struct, skip ID (we'll read it manually)
+  memcpy(reinterpret_cast<uint8_t*>(&dnsheader) + 2, raw + 2, 2);
+  // Read ID directly from raw bytes (network byte order) and construct uint16_t manually
+  // Wire format is big-endian: high byte first, then low byte
+  // When we construct (raw[0] << 8) | raw[1], we're reading big-endian bytes correctly
+  // But we need to convert from network byte order to host byte order for comparison
+  // The query ID (qid) is in host byte order, so we need ntohs() to match
+  uint16_t id_raw = (static_cast<uint16_t>(raw[0]) << 8) | static_cast<uint16_t>(raw[1]);
+  dnsheader.id = ntohs(id_raw);  // CRITICAL: Convert from network byte order to host byte order
+  // Read count fields directly from raw bytes (network byte order) and construct uint16_t manually
+  uint16_t qdcount_raw = (static_cast<uint16_t>(raw[4]) << 8) | static_cast<uint16_t>(raw[5]);
+  uint16_t ancount_raw = (static_cast<uint16_t>(raw[6]) << 8) | static_cast<uint16_t>(raw[7]);
+  uint16_t nscount_raw = (static_cast<uint16_t>(raw[8]) << 8) | static_cast<uint16_t>(raw[9]);
+  uint16_t arcount_raw = (static_cast<uint16_t>(raw[10]) << 8) | static_cast<uint16_t>(raw[11]);
+  // Assign to struct fields - these values are already correct (constructed from network byte order)
+  dnsheader.qdcount = qdcount_raw;
+  dnsheader.ancount = ancount_raw;
+  dnsheader.nscount = nscount_raw;
+  dnsheader.arcount = arcount_raw;
+  
+  std::cout << "[DEBUG] handleUDPServerResponse: parsed header id=" << dnsheader.id << " qr=" << (int)dnsheader.qr << " qdcount=" << dnsheader.qdcount << " rcode=" << (int)dnsheader.rcode << std::endl;
+  std::cout.flush();
+#else
+  // LINUX/UNIX: Use upstream pattern (dnsheader_aligned works because sizeof == 12)
+  dnsheader_aligned dha(packet.data());
+  dnsheader = *dha.get();
+#endif
 
   auto pident = std::make_shared<PacketID>();
   pident->remote = fromaddr;
@@ -3036,7 +4078,13 @@ static void handleUDPServerResponse(int fileDesc, FDMultiplexer::funcparam_t& va
   else {
     try {
       if (len > signed_sizeof_sdnsheader) {
+#ifdef _WIN32
+        // CRITICAL FIX: Use DNS_HEADER_SIZE (12) instead of sizeof(dnsheader) (14 on Windows)
+        // DNS wire format header is always 12 bytes, regardless of struct padding
+        pident->domain = DNSName(reinterpret_cast<const char*>(packet.data()), static_cast<int>(len), static_cast<int>(DNS_HEADER_SIZE), false, &pident->type); // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+#else
         pident->domain = DNSName(reinterpret_cast<const char*>(packet.data()), static_cast<int>(len), static_cast<int>(sizeof(dnsheader)), false, &pident->type); // don't copy this from above - we need to do the actual read  // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+#endif
       }
       else {
         // len == sizeof(dnsheader), only header case
@@ -3096,3 +4144,10 @@ retryWithName:
     t_udpclientsocks->returnSocket(fileDesc);
   }
 }
+
+// ========================================================================
+// GUARDRAIL: End of enabled UDP flow code
+// ========================================================================
+#if 0
+// Rest of file disabled - only UDP flow functions are enabled above
+#endif

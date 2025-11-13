@@ -77,12 +77,28 @@ typedef unsigned int gid_t;
 #endif
 
 // Control message header
-struct msghdr;
 struct cmsghdr {
   size_t cmsg_len;
   int cmsg_level;
   int cmsg_type;
   /* unsigned char cmsg_data[]; */
+};
+
+// I/O vector structure (for scatter/gather I/O)
+struct iovec {
+  void* iov_base;
+  size_t iov_len;
+};
+
+// Message header structure (for sendmsg/recvmsg)
+struct msghdr {
+  void* msg_name;          // Optional address
+  int msg_namelen;         // Size of address
+  struct iovec* msg_iov;   // Scatter/gather array
+  size_t msg_iovlen;       // Number of elements in msg_iov
+  void* msg_control;       // Ancillary data
+  size_t msg_controllen;   // Ancillary data buffer length
+  int msg_flags;           // Flags on received message
 };
 
 // Unix socket address

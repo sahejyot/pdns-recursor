@@ -24,8 +24,10 @@
 #include "syncres.hh"
 #include "mtasker.hh"
 #include "utility.hh"
+#include "arguments.hh"  // For arg()
 #include "dns.hh"  // For RCode
 #include "root-addresses.hh"  // For root hints
+#include "pdnsexception.hh"  // For PDNSException
 #include <event2/util.h>  // For evutil_make_socket_nonblocking
 #include <iomanip>
 #include <thread>
@@ -44,6 +46,9 @@ extern thread_local std::unique_ptr<FDMultiplexer> t_fdm;
 
 // Initialization function to avoid incomplete type issues
 extern void initializeMTaskerInfrastructure();
+extern void initializeOptionalVariablesForUpstream();
+extern void registerListenSocket(int socketFd, const ComboAddress& address);
+extern void startDoResolve(void* arg);
 
 // Prime root hints into cache (based on putDefaultHintsIntoCache from reczones-helpers.cc)
 static void primeRootHints(time_t now)
@@ -179,7 +184,7 @@ void handleDNSQuery(int fd, boost::any& param) {
     }
     // Note: This will be called from either:
     // 1. LIBEVENT/WSAEventSelect (primary) - logged in libeventmplexer.cc
-    // 2. Manual select() workaround (fallback) - logged before this call
+    // 2. All I/O events are handled by t_fdm->run() via WSAEventSelect
     std::cout << "[handleDNSQuery] CALLED! fd=" << fd << std::endl;
     
     char buffer[512];
@@ -300,12 +305,13 @@ void handleDNSQuery(int fd, boost::any& param) {
     std::cout << "  - remote: " << comboWriter->getRemote() << std::endl;
     
     // Hand off resolution so the event loop can keep running (like upstream)
-    // Upstream: pdns_recursor.cc:2436-2440 - creates DNSComboWriter and passes to startDoResolve
+    // Upstream: pdns_recursor.cc:2723 - creates DNSComboWriter and passes to startDoResolve
+    // UPDATED: Now using upstream startDoResolve() instead of custom resolveTaskFunc()
     if (g_multiTasker) {
-        g_multiTasker->makeThread(resolveTaskFunc, comboWriter.release());
-        std::cout << "[DEBUG] Enqueued resolve task to MTasker with DNSComboWriter" << std::endl;
+        g_multiTasker->makeThread(startDoResolve, comboWriter.release());
+        std::cout << "[DEBUG] Enqueued resolve task to MTasker with DNSComboWriter (using upstream startDoResolve)" << std::endl;
     } else {
-        resolveTaskFunc(comboWriter.release());
+        startDoResolve(comboWriter.release());
     }
     // Return quickly to keep pumping the event loop
 }
@@ -359,6 +365,14 @@ static void resolveTaskFunc(void* pv) {
         std::cout << "[DEBUG] MT: initialized SyncRes::s_maxqperq=" << SyncRes::s_maxqperq << std::endl;
     }
     
+    // CRITICAL FIX: Initialize s_maxcachettl to prevent TTL from being set to 0
+    // Upstream: rec-main.cc:1813 - SyncRes::s_maxcachettl = max(::arg().asNum("max-cache-ttl"), 15);
+    // If uninitialized, s_maxcachettl is 0, causing min(s_maxcachettl, rec.d_ttl) to always return 0
+    if (SyncRes::s_maxcachettl == 0) {
+        SyncRes::s_maxcachettl = 86400; // Default: 1 day (24 hours) - upstream default is max(::arg().asNum("max-cache-ttl"), 15)
+        std::cout << "[DEBUG] MT: initialized SyncRes::s_maxcachettl=" << SyncRes::s_maxcachettl << std::endl;
+    }
+    
     // CRITICAL: Match upstream pattern - create SyncRes at start of function, destroy when function returns
     // Upstream: pdns_recursor.cc:976 - SyncRes resolver(comboWriter->d_now);
     // Upstream lets resolver be destroyed when startDoResolve() function returns (line 2017)
@@ -386,6 +400,35 @@ static void resolveTaskFunc(void* pv) {
         std::vector<DNSRecord> ret;
         int rcode = resolver.beginResolve(queryName, QType(comboWriter->d_mdp.d_qtype), QClass(comboWriter->d_mdp.d_qclass), ret);
         std::cout << "[DEBUG] MT: beginResolve done: rcode=" << rcode << " (RCode::NXDomain=" << RCode::NXDomain << "), records=" << ret.size() << std::endl;
+        
+        // ========================================================================
+        // TTL CHECK: Log actual TTL values from beginResolve() before any modifications
+        // ========================================================================
+        time_t current_time = time(nullptr);
+        std::cout << "[TTL_CHECK] Current time (now): " << current_time << std::endl;
+        std::cout << "[TTL_CHECK] Checking TTL values from beginResolve() - total records: " << ret.size() << std::endl;
+        for (size_t i = 0; i < ret.size(); ++i) {
+            const auto& rec = ret[i];
+            uint32_t ttl_value = rec.d_ttl;
+            bool looks_like_ttd = (ttl_value > 1000000000);  // TTD values are Unix timestamps (large numbers)
+            bool is_zero = (ttl_value == 0);
+            bool is_negative = (ttl_value > current_time && ttl_value < current_time + 86400);  // Might be TTD close to now
+            
+            std::cout << "[TTL_CHECK] Record[" << i << "]: name=" << rec.d_name 
+                      << " type=" << rec.d_type 
+                      << " place=" << static_cast<int>(rec.d_place)
+                      << " ttl=" << ttl_value;
+            if (is_zero) {
+                std::cout << " [WARNING: TTL IS ZERO!]";
+            }
+            if (looks_like_ttd) {
+                uint32_t calculated_ttl = (ttl_value > current_time) ? (ttl_value - current_time) : 0;
+                std::cout << " [WARNING: LOOKS LIKE TTD! calculated_ttl=" << calculated_ttl << "]";
+            }
+            std::cout << std::endl;
+        }
+        // ========================================================================
+        
         // Debug: Log all records for NXDOMAIN
         if (rcode == RCode::NXDomain) {
             std::cout << "[DEBUG] MT: NXDOMAIN response - logging all records:" << std::endl;
@@ -561,8 +604,14 @@ static void resolveTaskFunc(void* pv) {
         std::cout.flush(); // Ensure output is flushed
               std::cout << "[DEBUG] MT: After sendto() for " << comboWriter->d_mdp.d_qname << ", resolver will be destroyed when function returns" << std::endl;
               std::cout.flush();
+          } catch (const PDNSException& e) {
+              std::cerr << "MT: PDNSException during resolve/send: " << e.reason << std::endl;
+              std::cerr.flush();
           } catch (const std::exception& e) {
               std::cerr << "MT: exception during resolve/send: " << e.what() << std::endl;
+              std::cerr.flush();
+          } catch (...) {
+              std::cerr << "MT: unknown exception during resolve/send" << std::endl;
               std::cerr.flush();
           }
           // CRITICAL: Match upstream pattern - resolver is destroyed here when function returns
@@ -580,6 +629,10 @@ static void resolveTaskFunc(void* pv) {
 
 // Simple DNS resolver test
 int main() {
+    // Initialize argument map with default values needed by pdns_recursor.cc functions
+    // These are normally set by upstream's argument parsing, but we need them for minimal setup
+    ::arg().set("spoof-nearmiss-max", "If non-zero, assume spoofing after this many near misses") = "1";
+    
     try {
         std::cout << "PowerDNS Recursor Windows POC - Starting DNS Server..." << std::endl;
         
@@ -640,6 +693,15 @@ int main() {
         }
         std::cout << "Bound to port 5533" << std::endl;
         
+        // Register socket with g_listenSocketsAddresses for upstream functions (handleNewUDPQuestion)
+        // This allows upstream functions to look up the destination address using rplookup()
+        ComboAddress listenAddress;
+        listenAddress.sin4.sin_family = AF_INET;
+        listenAddress.sin4.sin_addr = server_addr.sin_addr;
+        listenAddress.sin4.sin_port = server_addr.sin_port;
+        registerListenSocket(g_udp_socket, listenAddress);
+        std::cout << "Registered socket with g_listenSocketsAddresses for upstream functions" << std::endl;
+        
         // Initialize global caches (required by SyncRes)
         std::cout << "[DEBUG] About to initialize caches, g_recCache=" << (g_recCache ? "not null" : "null") << ", g_negCache=" << (g_negCache ? "not null" : "null") << std::endl;
         if (!g_recCache) {
@@ -662,7 +724,47 @@ int main() {
         
         // Initialize MTasker infrastructure for UDP resolution
         // These must be initialized before SyncRes can use asendto/arecvfrom
+        // Upstream: rec-main.cc:2930 - g_multiTasker = std::make_unique<MT_t>(::arg().asNum("stack-size"), ::arg().asNum("stack-cache-size"));
+        // For POC, use default values matching upstream defaults
         initializeMTaskerInfrastructure();
+        // Verify g_multiTasker was initialized correctly
+        if (!g_multiTasker) {
+            std::cerr << "[ERROR] g_multiTasker is NULL after initializeMTaskerInfrastructure()!" << std::endl;
+            std::cerr << "[ERROR] Reinitializing with explicit parameters (matching upstream pattern)" << std::endl;
+            // Upstream default: stack-size=200000, stack-cache-size=10 (from rec-rust-lib/cxxsettings-generated.cc)
+            size_t stackSize = 200000; // Default stack size
+            size_t stackCacheSize = 10; // Default stack cache size
+            g_multiTasker = std::make_unique<MT_t>(stackSize, stackCacheSize);
+            std::cout << "[DEBUG] Reinitialized g_multiTasker with stackSize=" << stackSize << " stackCacheSize=" << stackCacheSize << std::endl;
+        } else {
+            std::cout << "[DEBUG] g_multiTasker initialized successfully, pointer=" << static_cast<void*>(g_multiTasker.get()) << std::endl;
+        }
+        
+        // Initialize SyncRes static variables (required before calling startDoResolve)
+        // Upstream: rec-main.cc:1827 - SyncRes::s_maxqperq = ::arg().asNum("max-qperq");
+        // Default: rec-rust-lib/cxxsettings-generated.cc:107 - "50"
+        if (SyncRes::s_maxqperq == 0) {
+            SyncRes::s_maxqperq = 50; // Default max queries per query (upstream default)
+            std::cout << "[DEBUG] Initialized SyncRes::s_maxqperq=" << SyncRes::s_maxqperq << std::endl;
+        }
+        
+        // CRITICAL: Initialize SyncRes log mode (required for setId() to work correctly)
+        // Upstream: rec-main.cc:980 - SyncRes::setDefaultLogMode(g_quiet ? SyncRes::LogNone : SyncRes::Log);
+        // If s_lm is uninitialized, doLog() can crash when setId() is called
+        // For POC, use LogNone (quiet mode) to avoid logging issues
+        SyncRes::setDefaultLogMode(SyncRes::LogNone);
+        std::cout << "[DEBUG] Initialized SyncRes::s_lm=LogNone (quiet mode)" << std::endl;
+        // Upstream: rec-main.cc:1813 - SyncRes::s_maxcachettl = max(::arg().asNum("max-cache-ttl"), 15);
+        // Default: rec-rust-lib/cxxsettings-generated.cc - "86400" (1 day)
+        if (SyncRes::s_maxcachettl == 0) {
+            SyncRes::s_maxcachettl = 86400; // Default: 1 day (24 hours) - upstream default is max(::arg().asNum("max-cache-ttl"), 15)
+            std::cout << "[DEBUG] Initialized SyncRes::s_maxcachettl=" << SyncRes::s_maxcachettl << std::endl;
+        }
+        
+        // Initialize optional variables with defaults for upstream functions (startDoResolve, handleNewUDPQuestion)
+        // This sets all optional features (Lua, protobuf, etc.) to disabled/nullable values
+        initializeOptionalVariablesForUpstream();
+        std::cout << "Initialized optional variables for upstream functions" << std::endl;
         
         if (!t_fdm) {
             std::cerr << "Failed to create FDMultiplexer" << std::endl;
@@ -720,142 +822,9 @@ int main() {
                     std::cout << "[DEBUG] Event loop: schedule() loop completed after " << schedule_count << " iterations" << std::endl;
                 }
                 
-                // WINDOWS WORKAROUND: DISABLED FOR TESTING
-                // WSAEventSelect is working correctly - all events are handled by LIBEVENT/WSAEventSelect
-                // No MANUAL_SELECT logs appeared in testing, indicating workarounds are not needed
-                // If issues arise, re-enable these workarounds
-#ifdef _WIN32
-                // DISABLED: Manual select() check for incoming queries (BEFORE multiplexer)
-                // All incoming queries are handled by t_fdm->run() via WSAEventSelect
-                /*
-                if (g_udp_socket >= 0) {
-                    fd_set readfds;
-                    FD_ZERO(&readfds);
-                    FD_SET(g_udp_socket, &readfds);
-                    struct timeval tv = {0, 0};
-                    int select_result = select(g_udp_socket + 1, &readfds, nullptr, nullptr, &tv);
-                    if (select_result > 0 && FD_ISSET(g_udp_socket, &readfds)) {
-                        std::cout << "[IO_TRACKING] MANUAL_SELECT (BEFORE multiplexer): Detected data on socket " << g_udp_socket << ", calling handleDNSQuery" << std::endl;
-                        boost::any param = static_cast<evutil_socket_t>(g_udp_socket);
-                        handleDNSQuery(g_udp_socket, param);
-                    }
-                }
-                */
-                
-                // DISABLED: Manual select() check for outgoing UDP sockets (BEFORE multiplexer)
-                // All outgoing responses are handled by t_fdm->run() via WSAEventSelect
-                /*
-                if (g_multiTasker && t_fdm) {
-                    const auto& waiters = g_multiTasker->getWaiters();
-                    // Only process if there are waiters (avoid unnecessary work)
-                    if (!waiters.empty()) {
-                        if (loop_count % 100 == 0 || loop_count < 10) {
-                            std::cout << "[DEBUG] Windows workaround: checking " << waiters.size() << " waiting queries (loop=" << loop_count << ")" << std::endl;
-                        }
-                        
-                        fd_set readfds;
-                        FD_ZERO(&readfds);
-                        int maxfd = -1;
-                        std::map<int, std::shared_ptr<PacketID>> fdToPident;
-                        
-                        // Build fd_set from waiting UDP sockets
-                        for (const auto& waiter : waiters) {
-                            if (waiter.key->fd >= 0 && !waiter.key->closed) {
-                                // Validate socket is still valid
-                                int optval = 0;
-                                socklen_t optlen = sizeof(optval);
-                                int sock_check = getsockopt(waiter.key->fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&optval), &optlen);
-                                if (sock_check == 0) {
-                                    FD_SET(waiter.key->fd, &readfds);
-                                    if (waiter.key->fd > maxfd) maxfd = waiter.key->fd;
-                                    fdToPident[waiter.key->fd] = waiter.key;
-                                }
-                            }
-                        }
-                        
-                        if (maxfd >= 0) {
-                            // Non-blocking check for ready sockets
-                            struct timeval tv = {0, 0};
-                            int select_result = select(maxfd + 1, &readfds, nullptr, nullptr, &tv);
-                            
-                            if (select_result > 0) {
-                                std::cout << "[DEBUG] Windows workaround: select() detected " << select_result << " ready socket(s)" << std::endl;
-                                // Some sockets are ready - manually read and process responses
-                                for (const auto& [fd, pident] : fdToPident) {
-                                    if (FD_ISSET(fd, &readfds)) {
-                                        std::cout << "[DEBUG] Windows workaround: reading response from fd=" << fd << " qid=" << pident->id << " domain=" << pident->domain << std::endl;
-                                        try {
-                                            PacketBuffer packet;
-                                            packet.resize(65536);
-                                            ComboAddress fromaddr;
-                                            socklen_t addrlen = sizeof(fromaddr);
-                                            ssize_t len = recvfrom(fd, reinterpret_cast<char*>(packet.data()), packet.size(), 0, reinterpret_cast<sockaddr*>(&fromaddr), &addrlen);
-                                            if (len > 0) {
-                                                std::cout << "[DEBUG] Windows workaround: SUCCESS - recvfrom got " << len << " bytes on fd=" << fd << " qid=" << pident->id << " domain=" << pident->domain << ", sending to MTasker" << std::endl;
-                                                packet.resize(len);
-                                                int send_result = g_multiTasker->sendEvent(pident, &packet);
-                                                std::cout << "[DEBUG] Windows workaround: sendEvent() returned " << send_result << " for qid=" << pident->id << std::endl;
-                                                if (send_result > 0) {
-                                                    // Successfully woke up the waiting task - it will handle returning the socket
-                                                    std::cout << "[DEBUG] Windows workaround: Successfully woke up waiting task for qid=" << pident->id << std::endl;
-                                                } else {
-                                                    std::cout << "[DEBUG] Windows workaround: WARNING - sendEvent() returned " << send_result << " (no waiter found?)" << std::endl;
-                                                }
-                                            } else {
-                                                int werr = WSAGetLastError();
-                                                if (werr == WSAEWOULDBLOCK || werr == WSAENOTSOCK) {
-                                                    // Socket is not ready or invalid - this is OK, just means no data yet or socket was closed
-                                                    if (loop_count % 100 == 0 || loop_count < 10) {
-                                                        std::cout << "[DEBUG] Windows workaround: recvfrom would block or socket invalid on fd=" << fd << " qid=" << pident->id << " WSA error=" << werr << std::endl;
-                                                    }
-                                                } else {
-                                                    std::cout << "[DEBUG] Windows workaround: recvfrom failed on fd=" << fd << " qid=" << pident->id << " WSA error=" << werr << std::endl;
-                                                }
-                                            }
-                                        } catch (const std::exception& e) {
-                                            std::cerr << "[DEBUG] Windows workaround: exception: " << e.what() << std::endl;
-                                        }
-                                    }
-                                }
-                            } else if (select_result == 0) {
-                                // CRITICAL FIX: select() may return 0 even when data is available on connected UDP sockets
-                                // Try to peek/read from all waiting sockets anyway (select() is unreliable on Windows)
-                                if (loop_count % 100 == 0 || loop_count < 10) {
-                                    std::cout << "[DEBUG] Windows workaround: select() returned 0, but trying MSG_PEEK on all waiting sockets (select() may be unreliable)" << std::endl;
-                                }
-                                // Try MSG_PEEK on all waiting sockets
-                                for (const auto& [fd, pident] : fdToPident) {
-                                    char peek_buf[12];
-                                    ssize_t peek_result = recv(fd, peek_buf, sizeof(peek_buf), MSG_PEEK);
-                                    if (peek_result > 0) {
-                                        std::cout << "[DEBUG] Windows workaround: MSG_PEEK detected " << peek_result << " bytes on fd=" << fd << " qid=" << pident->id << " (select() missed it!)" << std::endl;
-                                        // Read the full response
-                                        try {
-                                            PacketBuffer packet;
-                                            packet.resize(65536);
-                                            ComboAddress fromaddr;
-                                            socklen_t addrlen = sizeof(fromaddr);
-                                            ssize_t len = recvfrom(fd, reinterpret_cast<char*>(packet.data()), packet.size(), 0, reinterpret_cast<sockaddr*>(&fromaddr), &addrlen);
-                                            if (len > 0) {
-                                                std::cout << "[DEBUG] Windows workaround: SUCCESS - recvfrom got " << len << " bytes on fd=" << fd << " qid=" << pident->id << ", sending to MTasker" << std::endl;
-                                                packet.resize(len);
-                                                int send_result = g_multiTasker->sendEvent(pident, &packet);
-                                                std::cout << "[DEBUG] Windows workaround: sendEvent() returned " << send_result << " for qid=" << pident->id << std::endl;
-                                            }
-                                        } catch (const std::exception& e) {
-                                            std::cerr << "[DEBUG] Windows workaround: exception: " << e.what() << std::endl;
-                                        }
-                                    }
-                                }
-                            } else {
-                                int werr = WSAGetLastError();
-                                std::cout << "[DEBUG] Windows workaround: select() failed WSA error=" << werr << std::endl;
-                            }
-                        }
-                    }
-                }
-                */
-#endif
+                // NOTE: WSAEventSelect is level-triggered and working correctly
+                // All I/O events (incoming queries and outgoing responses) are handled by t_fdm->run() via WSAEventSelect
+                // No manual select() workarounds are needed
                 
                 // 2. Run FD multiplexer to handle I/O events
                 // This processes both incoming queries and outgoing UDP responses
@@ -883,217 +852,8 @@ int main() {
                     std::cout << "  -> t_fdm->run() returned: " << events << " (iteration " << loop_count << ")" << std::endl;
                 }
                 
-                // WINDOWS WORKAROUND: DISABLED FOR TESTING
-                // Manual select() check after t_fdm->run() - not needed, WSAEventSelect handles all events
-#ifdef _WIN32
-                // DISABLED: Manual select() check for incoming queries (AFTER multiplexer)
-                /*
-                if (g_udp_socket >= 0) {
-                    fd_set readfds;
-                    FD_ZERO(&readfds);
-                    FD_SET(g_udp_socket, &readfds);
-                    struct timeval tv = {0, 0};
-                    int select_result = select(g_udp_socket + 1, &readfds, nullptr, nullptr, &tv);
-                    if (select_result > 0 && FD_ISSET(g_udp_socket, &readfds)) {
-                        std::cout << "[IO_TRACKING] MANUAL_SELECT (AFTER multiplexer): Detected data on socket " << g_udp_socket << ", calling handleDNSQuery" << std::endl;
-                        boost::any param = static_cast<evutil_socket_t>(g_udp_socket);
-                        handleDNSQuery(g_udp_socket, param);
-                    }
-                }
-                */
-#endif
-                
-                // Note: t_fdm->run() already called above - single multiplexer handles all I/O
-                
-                // WINDOWS WORKAROUND: DISABLED - Testing if this is causing blocking
-                // Responses might have arrived during t_fdm->run()
-                // but WSAEventSelect callback didn't fire
-#ifdef _WIN32
-                // DISABLED FOR TESTING
-                if (false && g_multiTasker && t_fdm) {
-                    const auto& waiters_after_io = g_multiTasker->getWaiters();
-                    if (!waiters_after_io.empty()) {
-                        // Check again for responses that arrived during I/O processing
-                        fd_set readfds;
-                        FD_ZERO(&readfds);
-                        int maxfd = -1;
-                        std::map<int, std::shared_ptr<PacketID>> fdToPident;
-                        
-                        for (const auto& waiter : waiters_after_io) {
-                            if (waiter.key->fd >= 0 && !waiter.key->closed) {
-                                FD_SET(waiter.key->fd, &readfds);
-                                if (waiter.key->fd > maxfd) maxfd = waiter.key->fd;
-                                fdToPident[waiter.key->fd] = waiter.key;
-                            }
-                        }
-                        
-                        if (maxfd >= 0) {
-                            struct timeval tv = {0, 0};
-                            int select_result = select(maxfd + 1, &readfds, nullptr, nullptr, &tv);
-                            
-                            if (select_result > 0) {
-                                std::cout << "[DEBUG] Windows workaround (after I/O): select() detected " << select_result << " ready socket(s)" << std::endl;
-                                for (const auto& [fd, pident] : fdToPident) {
-                                    if (FD_ISSET(fd, &readfds)) {
-                                        std::cout << "[DEBUG] Windows workaround (after I/O): reading response from fd=" << fd << " qid=" << pident->id << std::endl;
-                                        try {
-                                            PacketBuffer packet;
-                                            packet.resize(65536);
-                                            ComboAddress fromaddr;
-                                            socklen_t addrlen = sizeof(fromaddr);
-                                            ssize_t len = recvfrom(fd, reinterpret_cast<char*>(packet.data()), packet.size(), 0, reinterpret_cast<sockaddr*>(&fromaddr), &addrlen);
-                                            if (len > 0) {
-                                                std::cout << "[DEBUG] Windows workaround (after I/O): SUCCESS - recvfrom got " << len << " bytes on fd=" << fd << " qid=" << pident->id << ", sending to MTasker" << std::endl;
-                                                packet.resize(len);
-                                                int send_result = g_multiTasker->sendEvent(pident, &packet);
-                                                std::cout << "[DEBUG] Windows workaround (after I/O): sendEvent() returned " << send_result << " for qid=" << pident->id << std::endl;
-                                            }
-                                        } catch (const std::exception& e) {
-                                            std::cerr << "[DEBUG] Windows workaround (after I/O): exception: " << e.what() << std::endl;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-#endif
-                
-                // WINDOWS WORKAROUND: DISABLED - Testing if this is causing blocking
-                // Upstream relies on epoll (level-triggered) which doesn't have this issue
-                // On Windows with WSAEventSelect, we need to manually check for responses
-                // that libevent's win32 backend might miss
-#if 0
-                // DISABLED FOR TESTING - This workaround was added because we thought WSAEventSelect
-                // was edge-triggered, but the real issue was probably closing sockets twice.
-                // Disabling to test if it's causing the blocking issue.
-                // OLD CODE (commented out for potential revert):
-                //
-                if (g_multiTasker && t_fdm) {
-                    // CRITICAL: Check all waiting UDP sockets for data using select()
-                    // This is our workaround for WSAEventSelect edge-triggered behavior
-                    // Upstream doesn't need this because epoll is level-triggered
-                    const auto& waiters = g_multiTasker->getWaiters();
-                    // Debug: Always check waiters count (more aggressive)
-                    if (true) {  // Always log when checking
-                        std::cout << "[DEBUG] Windows workaround: waiters.size()=" << waiters.size() << " (loop=" << loop_count << ")";
-                        if (!waiters.empty()) {
-                            std::cout << " waiters:";
-                            for (const auto& waiter : waiters) {
-                                if (waiter.key->fd >= 0) {
-                                    std::cout << " fd=" << waiter.key->fd << " qid=" << waiter.key->id << " domain=" << waiter.key->domain;
-                                }
-                            }
-                        }
-                        std::cout << std::endl;
-                    }
-                    // Always process when waiters exist
-                    if (!waiters.empty()) {
-                        // Log every iteration when queries are waiting (very aggressive for debugging)
-                        std::cout << "[DEBUG] Windows workaround: checking " << waiters.size() << " waiting queries (loop=" << loop_count << ")" << std::endl;
-                        // List waiting queries for debugging
-                        for (const auto& waiter : waiters) {
-                            if (waiter.key->fd >= 0) {
-                                std::cout << "  - Waiting: fd=" << waiter.key->fd << " qid=" << waiter.key->id << " domain=" << waiter.key->domain << " remote=" << waiter.key->remote.toStringWithPort() << std::endl;
-                            }
-                        }
-                        fd_set readfds;
-                        FD_ZERO(&readfds);
-                        int maxfd = -1;
-                        std::map<int, std::shared_ptr<PacketID>> fdToPident;
-                        
-                        // Build fd_set from waiting UDP sockets
-                        // Validate each fd before adding to avoid WSAENOTSOCK errors
-                        for (const auto& waiter : waiters) {
-                            if (waiter.key->fd >= 0 && !waiter.key->closed) {
-                                // Validate socket is still valid before adding to fd_set
-                                // Use getsockopt to check if socket is valid
-                                int optval = 0;
-                                socklen_t optlen = sizeof(optval);
-                                int sock_check = getsockopt(waiter.key->fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&optval), &optlen);
-                                if (sock_check == 0) {
-                                    // Socket is valid, add to fd_set
-                                    FD_SET(waiter.key->fd, &readfds);
-                                    if (waiter.key->fd > maxfd) maxfd = waiter.key->fd;
-                                    fdToPident[waiter.key->fd] = waiter.key;
-                                } else {
-                                    // Socket is invalid (likely closed), skip it
-                                    int werr = WSAGetLastError();
-                                    std::cout << "[DEBUG] Windows workaround: skipping invalid fd=" << waiter.key->fd << " (WSA error=" << werr << ")" << std::endl;
-                                }
-                            }
-                        }
-                        
-                        if (maxfd >= 0) {
-                            // Non-blocking check for ready sockets
-                            struct timeval tv = {0, 0};
-                            int select_result = select(maxfd + 1, &readfds, nullptr, nullptr, &tv);
-                            // Always log select results when there are waiters (very aggressive for debugging)
-                            if (true) {  // Always log when waiters exist
-                                std::cout << "[DEBUG] Windows workaround: select() returned " << select_result << " for " << fdToPident.size() << " waiting sockets";
-                                if (select_result < 0) {
-                                    int werr = WSAGetLastError();
-                                    std::cout << " WSA error=" << werr;
-                                } else if (select_result > 0) {
-                                    std::cout << " ready fds:";
-                                    for (const auto& [fd, pident] : fdToPident) {
-                                        if (FD_ISSET(fd, &readfds)) {
-                                            std::cout << " " << fd << "(qid=" << pident->id << ",domain=" << pident->domain << ")";
-                                        }
-                                    }
-                                }
-                                std::cout << " maxfd=" << maxfd << " all fds:";
-                                for (const auto& [fd, pident] : fdToPident) {
-                                    std::cout << " " << fd << "(qid=" << pident->id << ")";
-                                }
-                                std::cout << std::endl;
-                            }
-                            if (select_result > 0) {
-                                // Some sockets are ready - manually trigger callbacks
-                                for (const auto& [fd, pident] : fdToPident) {
-                                    if (FD_ISSET(fd, &readfds)) {
-                                        std::cout << "[DEBUG] Windows workaround: select() detected data on fd=" << fd << ", manually triggering callback" << std::endl;
-                                        // Manually trigger the callback registered for this fd
-                                        // Use t_fdm's callback mechanism to call handleUDPServerResponse
-                                        // The callback is registered when we call addReadFD in asendto
-                                        try {
-                                            boost::any param = pident;
-                                            // Get the callback from t_fdm - we need to access it
-                                            // Since we can't easily access private members, let's use
-                                            // a helper function or directly call via the callback
-                                            // Actually, we can use the callback that was registered
-                                            // But we need access to the callback... let's try a different approach:
-                                            // Trigger the libevent callback manually by simulating the event
-                                            // Or better: use t_fdm's internal mechanism
-                                            // For now, let's just call the registered callback directly
-                                            // We'll need to make handleUDPServerResponse accessible
-                                            // Actually, the simplest: call it through the callback we registered
-                                            // But since it's static, we need to make it accessible
-                                            // Let's use a function pointer or make it non-static
-                                            // Actually, let's just use the FDMultiplexer's mechanism
-                                            // We can't easily do this, so let's make handleUDPServerResponse non-static
-                                            // Or declare it in a header
-                                            // For now, let's use a workaround: call recvfrom directly and process
-                                            PacketBuffer packet;
-                                            packet.resize(65536);
-                                            ComboAddress fromaddr;
-                                            socklen_t addrlen = sizeof(fromaddr);
-                                            ssize_t len = recvfrom(fd, reinterpret_cast<char*>(packet.data()), packet.size(), 0, reinterpret_cast<sockaddr*>(&fromaddr), &addrlen);
-                                            if (len > 0) {
-                                                std::cout << "[DEBUG] Windows workaround: recvfrom got " << len << " bytes, sending to MTasker" << std::endl;
-                                                packet.resize(len);
-                                                g_multiTasker->sendEvent(pident, &packet);
-                                            }
-                                        } catch (const std::exception& e) {
-                                            std::cerr << "[DEBUG] Windows workaround: exception: " << e.what() << std::endl;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-#endif
+                // NOTE: t_fdm->run() handles all I/O events (incoming queries and outgoing responses)
+                // WSAEventSelect is level-triggered and working correctly - no manual select() workarounds needed
                 
                 if (events < 0) {
                     std::cerr << "Multiplexer error: " << events << std::endl;

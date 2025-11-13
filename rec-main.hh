@@ -38,17 +38,66 @@
 #else
 // Minimal stub types for when Lua is disabled
 // These allow DNSComboWriter to compile without Lua dependencies
-class RecursorLua4 {
-public:
-    struct MetaValue {
-        // Minimal stub - not used when Lua is disabled
-    };
-};
 namespace LuaContext {
     class LuaObject {
         // Minimal stub - not used when Lua is disabled
     };
 }
+// Forward declaration for ProxyProtocolValue (defined in proxy-protocol.hh, included later)
+struct ProxyProtocolValue;
+class RecursorLua4 {
+public:
+    struct MetaValue {
+        // Minimal stub - not used when Lua is disabled
+        std::string stringVal;
+        int intVal{0};
+    };
+    // DNSQuestion stub for startDoResolve (when Lua is disabled)
+    // NOTE: This is a minimal stub - when Lua is enabled, use the real DNSQuestion from lua-recursor4.hh
+    struct DNSQuestion {
+        DNSQuestion(const ComboAddress& prem, const ComboAddress& ploc, const ComboAddress& rem, const ComboAddress& loc, const DNSName& query, uint16_t type, bool tcp, bool& variable_, bool& wantsRPZ_, bool& logResponse_, bool& addPaddingToResponse_, const struct timeval& queryTime_) 
+            : qname(query), interface_local(ploc), interface_remote(prem), local(loc), remote(rem), variable(variable_), wantsRPZ(wantsRPZ_), logResponse(logResponse_), addPaddingToResponse(addPaddingToResponse_), queryTime(queryTime_), qtype(type), isTcp(tcp), validationState(vState::Indeterminate) { }
+        const DNSName& qname;
+        const ComboAddress& interface_local;
+        const ComboAddress& interface_remote;
+        const ComboAddress& local;
+        const ComboAddress& remote;
+        const ComboAddress* fromAuthIP{nullptr};
+        const struct dnsheader* dh{nullptr};
+        const std::vector<std::pair<uint16_t, std::string>>* ednsOptions{nullptr};
+        const uint16_t* ednsFlags{nullptr};
+        std::vector<DNSRecord>* currentRecords{nullptr};
+        void* appliedPolicy{nullptr};  // DNSFilterEngine::Policy* (forward declared - use void* to avoid including filterpo.hh here)
+        std::unordered_set<std::string>* policyTags{nullptr};
+        const std::vector<ProxyProtocolValue>* proxyProtocolValues{nullptr};  // ProxyProtocolValue forward declared above
+        std::unordered_map<std::string, bool>* discardedPolicies{nullptr};
+        std::string* extendedErrorExtra{nullptr};
+        boost::optional<uint16_t>* extendedErrorCode{nullptr};
+        std::string requestorId;
+        std::string deviceId;
+        std::string deviceName;
+        bool& variable;
+        bool& wantsRPZ;
+        bool& logResponse;
+        bool& addPaddingToResponse;
+        std::map<std::string, MetaValue> meta;
+        struct timeval queryTime;
+        std::vector<DNSRecord> records;
+        std::string followupFunction;
+        std::string followupPrefix;
+        std::string udpQuery;
+        std::string udpAnswer;
+        std::string udpCallback;
+        LuaContext::LuaObject data;
+        DNSName followupName;
+        ComboAddress udpQueryDest;
+        unsigned int tag{0};
+        int rcode{0};
+        const uint16_t qtype;
+        bool isTcp;
+        vState validationState;  // vState is defined in validate.hh (included via validate-recursor.hh)
+    };
+};
 #endif
 #include "mplexer.hh"
 #include "namespaces.hh"
@@ -68,6 +117,7 @@ namespace LuaContext {
 #include "rec-eventtrace.hh"   // For RecEventTrace
 #include "ednssubnet.hh"        // For EDNSSubnetOpts
 #include "dnsparser.hh"        // For MOADNSParser
+#include "validate-recursor.hh"  // For ValidationState
 
 #ifdef NOD_ENABLED
 #include "nod.hh"

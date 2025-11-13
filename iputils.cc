@@ -339,6 +339,54 @@ int sendOnNBSocket(int fileDesc, const struct msghdr* msgh)
 }
 #endif // !_WIN32
 
+#ifdef _WIN32
+// ========================================================================
+// WINDOWS IMPLEMENTATION: sendOnNBSocket and fillMSGHdr
+// ========================================================================
+// On Windows, sendmsg() is not available, so we use sendto() for UDP sockets
+// This is a simplified implementation that works for UDP responses
+// CRITICAL: This implementation is essential for sending DNS responses on Windows
+// ========================================================================
+int sendOnNBSocket(int fileDesc, const struct msghdr* msgh)
+{
+  // On Windows, for UDP sockets, we can use sendto() directly
+  // msgh->msg_iov[0] contains the data to send
+  // msgh->msg_name contains the destination address
+  if (msgh->msg_iovlen == 0 || msgh->msg_iov == nullptr) {
+    WSASetLastError(WSAEINVAL);
+    return WSAEINVAL;
+  }
+  
+  const char* data = static_cast<const char*>(msgh->msg_iov[0].iov_base);
+  int datalen = static_cast<int>(msgh->msg_iov[0].iov_len);
+  const struct sockaddr* addr = static_cast<const struct sockaddr*>(msgh->msg_name);
+  int addrlen = static_cast<int>(msgh->msg_namelen);
+  
+  int sendErr = 0;
+  int sent = sendto(fileDesc, data, datalen, 0, addr, addrlen);
+  if (sent == SOCKET_ERROR) {
+    sendErr = WSAGetLastError();
+  }
+  return sendErr;
+}
+
+void fillMSGHdr(struct msghdr* msgh, struct iovec* iov, cmsgbuf_aligned* cbuf, size_t cbufsize, char* data, size_t datalen, ComboAddress* addr)
+{
+  iov->iov_base = data;
+  iov->iov_len = datalen;
+
+  memset(msgh, 0, sizeof(struct msghdr));
+
+  msgh->msg_control = cbuf;
+  msgh->msg_controllen = cbufsize;
+  msgh->msg_name = addr;
+  msgh->msg_namelen = addr->getSocklen();
+  msgh->msg_iov = iov;
+  msgh->msg_iovlen = 1;
+  msgh->msg_flags = 0;
+}
+#endif // _WIN32
+
 // be careful: when using this for receive purposes, make sure addr->sin4.sin_family is set appropriately so getSocklen works!
 // be careful: when using this function for *send* purposes, be sure to set cbufsize to 0!
 // be careful: if you don't call addCMsgSrcAddr after fillMSGHdr, make sure to set msg_control to NULL

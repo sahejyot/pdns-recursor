@@ -52,8 +52,10 @@ LWResult::Result arecvtcp(PacketBuffer& /* data */, size_t /* len */, std::share
   return LWResult::Result::PermanentError;
 }
 
-// UDP functions - provide stubs only if real ones are not enabled
-#if !defined(ENABLE_WINDOWS_POC_PARTS)
+// UDP functions - DISABLED: Real implementations are in pdns_recursor.cc
+// These stubs are commented out to avoid duplicate definition errors
+#if 0
+// #if !defined(ENABLE_WINDOWS_POC_PARTS)
 LWResult::Result asendto(const void* /* data */, size_t /* len */, int /* flags */,
                          const ComboAddress& /* toAddress */, uint16_t /* qid */, const DNSName& /* domain */, uint16_t /* qtype */,
                          const std::optional<EDNSSubnetOpts>& /* ecs */, int* /* fileDesc */, timeval& /* now */)
@@ -68,13 +70,19 @@ LWResult::Result arecvfrom(PacketBuffer& /* packet */, int /* flags */, const Co
   len = 0;
   return LWResult::Result::PermanentError;
 }
+// #endif
 #endif
 
+// mthreadSleep - DISABLED: Now using real implementation from pdns_recursor.cc
+// The real implementation uses g_multiTasker->waitEvent() for proper MTasker integration
+// This stub is no longer needed since pdns_recursor.cc is included in the build
+#if 0
 void mthreadSleep(unsigned int jitterMsec)
 {
   // Simple sleep stub using std::this_thread::sleep_for
   std::this_thread::sleep_for(std::chrono::milliseconds(jitterMsec));
 }
+#endif
 
 // nsspeeds_t methods - stubbed for POC
 size_t nsspeeds_t::putPB(time_t /* cutoff */, const std::string& /* pbuf */)
@@ -87,11 +95,8 @@ size_t nsspeeds_t::getPB(const std::string& /* serverID */, size_t /* maxSize */
   return 0;
 }
 
-// primeHints - stubbed for POC
-bool primeHints(time_t /* now */)
-{
-  return false;
-}
+// primeHints - REMOVED: Now using real implementation from reczones.cc
+// The stub is no longer needed since reczones.cc is included in the build
 
 // RecResponseStats constructor - needs to match upstream signature
 // From rec-responsestats.cc: RecResponseStats::RecResponseStats() : d_sizecounters("SizeCounters", sizeBounds())

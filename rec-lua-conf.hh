@@ -32,6 +32,14 @@
 #include "fstrm_logger.hh"
 #include "rpzloader.hh"
 
+// Forward declare AdditionalMode - it's defined in syncres.hh when HAVE_LUA=0
+// or in this file when HAVE_LUA!=0
+#if !(defined(HAVE_LUA) && HAVE_LUA != 0)
+// When Lua is disabled, AdditionalMode is defined in syncres.hh
+// Forward declare it here so we can use it in LuaConfigItems
+enum class AdditionalMode : uint8_t;
+#endif
+
 struct ProtobufExportConfig
 {
   std::set<uint16_t> exportTypes = {QType::A, QType::AAAA, QType::CNAME};
@@ -75,6 +83,9 @@ struct TrustAnchorFileInfo
   std::string fname;
 };
 
+// AdditionalMode is already defined in syncres.hh when HAVE_LUA=0
+// Don't redefine it here to avoid duplicate definition
+#if defined(HAVE_LUA) && HAVE_LUA != 0
 enum class AdditionalMode : uint8_t
 {
   Ignore,
@@ -83,6 +94,7 @@ enum class AdditionalMode : uint8_t
   ResolveImmediately,
   ResolveDeferred
 };
+#endif
 
 struct ProxyMappingCounts
 {

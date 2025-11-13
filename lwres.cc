@@ -691,9 +691,22 @@ static LWResult::Result asyncresolve(const ComboAddress& address, const DNSName&
     }
 
     lwr->d_records.reserve(mdp.d_answers.size());
+    // ========================================================================
+    // TTL CHECK: Log TTL values from parsed server response
+    // ========================================================================
+    std::cout << "[TTL_CHECK lwres] Parsed " << mdp.d_answers.size() << " records from server response:" << std::endl;
     for (const auto& answer : mdp.d_answers) {
+      std::cout << "[TTL_CHECK lwres]   Record: name=" << answer.d_name 
+                << " type=" << answer.d_type 
+                << " place=" << static_cast<int>(answer.d_place)
+                << " ttl=" << answer.d_ttl;
+      if (answer.d_ttl == 0) {
+        std::cout << " [WARNING: TTL IS ZERO FROM SERVER!]";
+      }
+      std::cout << std::endl;
       lwr->d_records.push_back(answer);
     }
+    // ========================================================================
 
     if (EDNSOpts edo; EDNS0Level > 0 && getEDNSOpts(mdp, &edo)) {
       lwr->d_haveEDNS = true;
