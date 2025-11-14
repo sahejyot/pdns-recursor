@@ -4013,7 +4013,12 @@ unsigned int makeUDPServerSockets(deferredAdd_t& deferredAdds, Logr::log_t log, 
     ComboAddress address{localAddress, defaultLocalPort};
     auto socketFd = FDWrapper(socket(address.sin4.sin_family, SOCK_DGRAM, 0));
     if (socketFd < 0) {
-      throw PDNSException("Making a UDP server socket for resolver: " + stringerror());
+#ifdef _WIN32
+      int err = WSAGetLastError();
+#else
+      int err = errno;
+#endif
+      throw PDNSException("Making a UDP server socket for resolver: " + stringerror(err));
     }
 
     if (!setSocketTimestamps(socketFd)) {
@@ -4022,19 +4027,34 @@ unsigned int makeUDPServerSockets(deferredAdd_t& deferredAdds, Logr::log_t log, 
     }
     if (IsAnyAddress(address)) {
       if (address.sin4.sin_family == AF_INET) {
+#ifdef _WIN32
+        // Windows: IP_PKTINFO is not available or works differently
+        // Skip setting GEN_IP_PKTINFO on Windows - destination address will be determined via other means
+        // (e.g., getsockname() or rplookup() fallback in handleNewUDPQuestion)
+#else
         if (setsockopt(socketFd, IPPROTO_IP, GEN_IP_PKTINFO, &one, sizeof(one)) == 0) { // linux supports this, so why not - might fail on other systems
           g_fromtosockets.insert(socketFd);
         }
+#endif
       }
 #ifdef IPV6_RECVPKTINFO
       if (address.sin4.sin_family == AF_INET6) {
+#ifdef _WIN32
+        // Windows: IPV6_RECVPKTINFO may not be available
+        // Skip setting IPV6_RECVPKTINFO on Windows - destination address will be determined via other means
+#else
         if (setsockopt(socketFd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof(one)) == 0) {
           g_fromtosockets.insert(socketFd);
         }
+#endif
       }
 #endif
       if (address.sin6.sin6_family == AF_INET6 && setsockopt(socketFd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one)) < 0) {
+#ifdef _WIN32
+        int err = WSAGetLastError();
+#else
         int err = errno;
+#endif
         SLOG(g_log << Logger::Warning << "Failed to set IPv6 socket to IPv6 only, continuing anyhow: " << stringerror(err) << endl,
              log->error(Logr::Warning, err, "Failed to set IPv6 socket to IPv6 only, continuing anyhow"));
       }
@@ -4081,7 +4101,11 @@ unsigned int makeUDPServerSockets(deferredAdd_t& deferredAdds, Logr::log_t log, 
 
     socklen_t socklen = address.getSocklen();
     if (::bind(socketFd, reinterpret_cast<struct sockaddr*>(&address), socklen) < 0) { // NOLINT(cppcoreguidelines-pro-type-reinterpret-cast)
+#ifdef _WIN32
+      int err = WSAGetLastError();
+#else
       int err = errno;
+#endif
       if (!configIsDefault || address != ComboAddress{"::1", defaultLocalPort}) {
         throw PDNSException("Resolver binding to server socket on " + address.toStringWithPort() + ": " + stringerror(err));
       }
