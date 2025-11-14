@@ -91,6 +91,7 @@ set(PDNS_RECURSOR_SOURCES
     recursor_cache.cc
     negcache.cc
     logger.cc
+    logging.cc
     # DNSSEC disabled on Windows POC - aggressive_nsec.cc requires DNSSEC functions
     # aggressive_nsec.cc
     # validate.cc

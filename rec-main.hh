@@ -30,6 +30,7 @@
 // INCLUDES - Comment out what's not needed for minimal DNSComboWriter
 // ========================================================================
 #include "logger.hh"
+#include "namespaces.hh"
 // COMMENTED OUT - Not needed for minimal DNSComboWriter usage
 // #include "logr.hh"
 // Lua is conditionally included - only if HAVE_LUA is enabled (not 0)
@@ -100,7 +101,6 @@ public:
 };
 #endif
 #include "mplexer.hh"
-#include "namespaces.hh"
 // COMMENTED OUT - Not needed for minimal DNSComboWriter usage
 // #include "rec-lua-conf.hh"
 // #include "rec-protozero.hh"

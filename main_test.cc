@@ -32,9 +32,10 @@
 #include <iomanip>
 #include <thread>
 #include "dnsrecords.hh"  // For reportAllTypes
-#include "rec-main.hh"    // For DNSComboWriter (minimal setup)
+#include "rec-main.hh"    // For DNSComboWriter (minimal setup), deferredAdd_t, makeUDPServerSockets
 #include "logging.hh"     // For Logging::Logger::create
 #include "logr.hh"        // For Logr::Logger
+#include <functional>     // For std::function (needed for deferredAdd_t)
 
 // Global caches (defined in globals_stub.cc, declared here as extern)
 extern std::unique_ptr<MemRecursorCache> g_recCache;
@@ -46,12 +47,18 @@ typedef MTasker<std::shared_ptr<PacketID>, PacketBuffer, PacketIDCompare> MT_t;
 extern thread_local std::unique_ptr<MT_t> g_multiTasker;
 extern thread_local std::unique_ptr<FDMultiplexer> t_fdm;
 
+// Forward declaration for deferredAdd_t (defined in rec-main.hh:381)
+typedef std::vector<std::pair<int, std::function<void(int, boost::any&)>>> deferredAdd_t;
+
 // Initialization function to avoid incomplete type issues
 extern void initializeMTaskerInfrastructure();
 extern void initializeOptionalVariablesForUpstream();
 extern void registerListenSocket(int socketFd, const ComboAddress& address);
 extern void startDoResolve(void* arg);
 extern void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& var);
+// Forward declaration for makeUDPServerSockets (declared in rec-main.hh:741, defined in pdns_recursor.cc:3998)
+// Logr::log_t is const std::shared_ptr<Logger>&, so we use that type to match the definition
+unsigned int makeUDPServerSockets(deferredAdd_t& deferredAdds, Logr::log_t log, bool doLog, unsigned int instances);
 
 // Prime root hints into cache (based on putDefaultHintsIntoCache from reczones-helpers.cc)
 static void primeRootHints(time_t now)
@@ -657,56 +664,65 @@ int main() {
         std::cout << "Winsock initialized" << std::endl;
 #endif
         
-        // Create UDP socket
-        g_udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
-        if (g_udp_socket < 0) {
-            std::cerr << "Failed to create UDP socket: " << strerror(errno) << std::endl;
+        // Initialize structured logging (required for makeUDPServerSockets and handleNewUDPQuestion)
+        // Upstream: rec-main.cc:3266-3271 - setupLogging() then g_slogudpin = g_slog->withName("in")->withValues("proto", Logging::Loggable("udp"));
+        extern std::shared_ptr<Logging::Logger> g_slog;
+        if (!g_slog) {
+            // Simple logger backend that outputs to cerr (similar to loggerBackend in rec-main.cc)
+            auto simpleLoggerBackend = [](const Logging::Entry& entry) {
+                std::cerr << "[" << entry.message;
+                if (entry.error) {
+                    std::cerr << " error=" << entry.error.get();
+                }
+                if (entry.name) {
+                    std::cerr << " subsystem=" << entry.name.get();
+                }
+                std::cerr << "]" << std::endl;
+            };
+            g_slog = Logging::Logger::create(simpleLoggerBackend);
+            if (g_slog) {
+                std::cout << "Initialized structured logging (g_slog) for makeUDPServerSockets" << std::endl;
+            } else {
+                std::cerr << "[WARNING] Failed to initialize structured logging - makeUDPServerSockets may fail" << std::endl;
+            }
+        }
+        
+        // Set up configuration for makeUDPServerSockets()
+        // Upstream: rec-main.cc uses ::arg()["local-address"] and ::arg()["local-port"]
+        ::arg().set("local-address", "Local address to listen on") = "0.0.0.0";  // Listen on all interfaces
+        ::arg().set("local-port", "Local port to listen on") = "5533";  // Alternative DNS port
+        ::arg().set("non-local-bind", "Allow binding to non-local addresses") = "no";  // Default: disabled (needed for mustDo() check)
+        
+        // Debug: Verify configuration was set correctly
+        std::cout << "[DEBUG] local-address = \"" << ::arg()["local-address"] << "\"" << std::endl;
+        std::cout << "[DEBUG] local-port = \"" << ::arg()["local-port"] << "\" (asNum=" << ::arg().asNum("local-port") << ")" << std::endl;
+        
+        // Use upstream makeUDPServerSockets() instead of manual socket creation
+        // This function handles socket creation, binding, and registration with g_listenSocketsAddresses
+        deferredAdd_t deferredAdds;
+        // g_slog is Logging::Logger, but withName() returns Logr::Logger (which is what makeUDPServerSockets expects)
+        std::shared_ptr<Logr::Logger> log = g_slog ? g_slog->withName("socket") : nullptr;
+        std::cout << "[DEBUG] About to call makeUDPServerSockets()..." << std::endl;
+        try {
+            unsigned int socketCount = makeUDPServerSockets(deferredAdds, log, true, 1);
+            std::cout << "[DEBUG] makeUDPServerSockets() returned: " << socketCount << std::endl;
+            std::cout << "Created " << socketCount << " UDP server socket(s) using makeUDPServerSockets()" << std::endl;
+        } catch (const PDNSException& e) {
+            std::cerr << "[ERROR] PDNSException in makeUDPServerSockets(): " << e.reason << std::endl;
+            return 1;
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] Exception in makeUDPServerSockets(): " << e.what() << std::endl;
             return 1;
         }
-        std::cout << "UDP socket created: " << g_udp_socket << std::endl;
         
-        // Use non-blocking socket; libevent expects non-blocking sockets
-        u_long mode = 1; // 1 = non-blocking
-        ioctlsocket(g_udp_socket, FIONBIO, &mode);
-
-#ifdef _WIN32
-        // Allow quick rebinding after restart
-        BOOL reuse = TRUE;
-        if (setsockopt(g_udp_socket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse)) != 0) {
-            std::cerr << "Warning: setsockopt(SO_REUSEADDR) failed, WSA " << WSAGetLastError() << std::endl;
-        }
-#else
-        int reuse = 1;
-        setsockopt(g_udp_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-#endif
-        
-        // Bind to port 5533 (alternative DNS port to avoid permission issues)
-        struct sockaddr_in server_addr;
-        memset(&server_addr, 0, sizeof(server_addr));
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_addr.s_addr = INADDR_ANY;
-        server_addr.sin_port = htons(5533);
-        
-        if (bind(g_udp_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-#ifdef _WIN32
-            int error = WSAGetLastError();
-            std::cerr << "Failed to bind to port 5533: WSA Error " << error << std::endl;
-#else
-            std::cerr << "Failed to bind to port 5533: " << strerror(errno) << std::endl;
-#endif
-            closesocket(g_udp_socket);
+        // Store first socket FD for compatibility (if needed elsewhere)
+        if (!deferredAdds.empty()) {
+            g_udp_socket = deferredAdds[0].first;
+            std::cout << "Primary UDP socket FD: " << g_udp_socket << std::endl;
+        } else {
+            std::cerr << "[ERROR] No sockets created by makeUDPServerSockets()!" << std::endl;
             return 1;
         }
-        std::cout << "Bound to port 5533" << std::endl;
-        
-        // Register socket with g_listenSocketsAddresses for upstream functions (handleNewUDPQuestion)
-        // This allows upstream functions to look up the destination address using rplookup()
-        ComboAddress listenAddress;
-        listenAddress.sin4.sin_family = AF_INET;
-        listenAddress.sin4.sin_addr = server_addr.sin_addr;
-        listenAddress.sin4.sin_port = server_addr.sin_port;
-        registerListenSocket(g_udp_socket, listenAddress);
-        std::cout << "Registered socket with g_listenSocketsAddresses for upstream functions" << std::endl;
         
         // Initialize global caches (required by SyncRes)
         std::cout << "[DEBUG] About to initialize caches, g_recCache=" << (g_recCache ? "not null" : "null") << ", g_negCache=" << (g_negCache ? "not null" : "null") << std::endl;
@@ -774,7 +790,10 @@ int main() {
         
         if (!t_fdm) {
             std::cerr << "Failed to create FDMultiplexer" << std::endl;
-            closesocket(g_udp_socket);
+            // Close all sockets created by makeUDPServerSockets()
+            for (const auto& deferred : deferredAdds) {
+                closesocket(deferred.first);
+            }
             return 1;
         }
         
@@ -795,17 +814,16 @@ int main() {
         std::cout << "  - t_fdm: " << t_fdm->getName() << std::endl;
         std::cout << "  - t_udpclientsocks: ready" << std::endl;
         
-        // Register incoming socket with t_fdm (single multiplexer like upstream)
+        // Register sockets from makeUDPServerSockets() with t_fdm (single multiplexer like upstream)
         // t_fdm will handle both incoming queries and outgoing responses
-        boost::any param;
-#ifdef _WIN32
-        param = static_cast<evutil_socket_t>(g_udp_socket);
-#endif
-        // Use upstream handleNewUDPQuestion instead of custom handleDNSQuery
-        // handleNewUDPQuestion uses recvmsg() and calls doProcessUDPQuestion -> startDoResolve
-        boost::any udpParam; // Empty param for handleNewUDPQuestion
-        t_fdm->addReadFD(g_udp_socket, handleNewUDPQuestion, udpParam);
-        std::cout << "Registered incoming socket with t_fdm multiplexer" << std::endl;
+        // makeUDPServerSockets() already added sockets to deferredAdds with handleNewUDPQuestion
+        for (const auto& deferred : deferredAdds) {
+            int socketFd = deferred.first;
+            const auto& handler = deferred.second;
+            boost::any udpParam; // Empty param for handleNewUDPQuestion
+            t_fdm->addReadFD(socketFd, handler, udpParam);
+            std::cout << "Registered socket FD " << socketFd << " with t_fdm multiplexer" << std::endl;
+        }
         
         // No direct recv test to avoid consuming datagrams
         

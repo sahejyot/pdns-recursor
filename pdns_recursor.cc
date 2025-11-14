@@ -118,6 +118,7 @@ static std::set<int> g_fromtosockets; // Sockets using sendfromto() mechanism
 NetmaskGroup g_paddingFrom; // Padding source addresses (default = empty = disabled)
 size_t g_proxyProtocolMaximumSize = 0; // Max proxy protocol size (0 = disabled)
 size_t g_maxUDPQueriesPerRound = 1; // Max queries per recvmsg() round (default = 1)
+bool g_reusePort{false}; // SO_REUSEPORT flag (not available on Windows, stays false)
 uint16_t g_udpTruncationThreshold = 512; // UDP truncation threshold (default = 512)
 std::atomic<bool> g_quiet{false}; // Quiet mode (default = false)
 bool g_allowNoRD{false}; // Allow queries without RD flag (default = false)
@@ -3991,10 +3992,10 @@ void handleNewUDPQuestion(int fileDesc, FDMultiplexer::funcparam_t& /* var */) /
   t_Counters.updateSnap(g_regressionTestMode);
 }
 
-#if 0
-// Rest of disabled code continues below (doProcessUDPQuestion and handleNewUDPQuestion are now enabled above)
+// ENABLED: makeUDPServerSockets() - Windows compatibility changes applied
 // The two last arguments to makeUDPServerSockets are used for logging purposes only
-unsigned int makeUDPServerSockets(deferredAdd_t& deferredAdds, Logr::log_t log, bool doLog, unsigned int instances)
+// Using fully qualified type because deferredAdd_t typedef may not be visible here
+unsigned int makeUDPServerSockets(std::vector<std::pair<int, std::function<void(int, boost::any&)>>>& deferredAdds, Logr::log_t log, bool doLog, unsigned int instances)
 {
   int one = 1;
   vector<string> localAddresses;
@@ -4049,7 +4050,12 @@ unsigned int makeUDPServerSockets(deferredAdd_t& deferredAdds, Logr::log_t log, 
 #endif
       }
 #endif
-      if (address.sin6.sin6_family == AF_INET6 && setsockopt(socketFd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one)) < 0) {
+      if (address.sin6.sin6_family == AF_INET6 && setsockopt(socketFd, IPPROTO_IPV6, IPV6_V6ONLY,
+#ifdef _WIN32
+                                                              (const char*)&one, sizeof(one)) < 0) {
+#else
+                                                              &one, sizeof(one)) < 0) {
+#endif
 #ifdef _WIN32
         int err = WSAGetLastError();
 #else
@@ -4126,6 +4132,8 @@ unsigned int makeUDPServerSockets(deferredAdd_t& deferredAdds, Logr::log_t log, 
   return localAddresses.size();
 }
 
+#if 0
+// Rest of disabled code - makeUDPServerSockets() is enabled above
 static bool trySendingQueryToWorker(unsigned int target, ThreadMSG* tmsg)
 {
   auto& targetInfo = RecThreadInfo::info(target);
