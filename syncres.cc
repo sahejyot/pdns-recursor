@@ -6084,7 +6084,9 @@ bool SyncRes::doResolveAtThisIP(const std::string& prefix, const DNSName& qname,
 
 void SyncRes::handleNewTarget(const std::string& prefix, const DNSName& qname, const DNSName& newtarget, const QType qtype, std::vector<DNSRecord>& ret, int& rcode, unsigned int depth, const std::vector<DNSRecord>& recordsFromAnswer, vState& state)
 {
+  std::cout << "[DEBUG handleNewTarget] ENTRY: qname=" << qname << " newtarget=" << newtarget << " qtype=" << qtype << " depth=" << depth << " d_followCNAME=" << d_followCNAME << std::endl;
   if (newtarget == qname) {
+    std::cout << "[DEBUG handleNewTarget] CNAME to self detected, returning SERVFAIL" << std::endl;
     LOG(prefix << qname << ": Status=got a CNAME referral to self, returning SERVFAIL" << endl);
     ret.clear();
     rcode = RCode::ServFail;
@@ -6092,24 +6094,30 @@ void SyncRes::handleNewTarget(const std::string& prefix, const DNSName& qname, c
   }
   if (newtarget.isPartOf(qname)) {
     // a.b.c. CNAME x.a.b.c will go to great depths with QM on
+    std::cout << "[DEBUG handleNewTarget] CNAME to child detected, disabling QM" << std::endl;
     LOG(prefix << qname << ": Status=got a CNAME referral to child, disabling QM" << endl);
     setQNameMinimization(false);
   }
 
   if (!d_followCNAME) {
+    std::cout << "[DEBUG handleNewTarget] d_followCNAME is false, returning NoError" << std::endl;
     rcode = RCode::NoError;
     return;
   }
 
   // Check to see if we already have seen the new target as a previous target or that the chain is too long
+  std::cout << "[DEBUG handleNewTarget] About to check for CNAME loop, ret.size()=" << ret.size() << std::endl;
   const auto [CNAMELoop, numCNAMEs] = scanForCNAMELoop(newtarget, ret);
+  std::cout << "[DEBUG handleNewTarget] CNAME loop check: CNAMELoop=" << CNAMELoop << " numCNAMEs=" << numCNAMEs << " s_max_CNAMES_followed=" << s_max_CNAMES_followed << std::endl;
   if (CNAMELoop) {
+    std::cout << "[DEBUG handleNewTarget] CNAME loop detected, returning SERVFAIL" << std::endl;
     LOG(prefix << qname << ": Status=got a CNAME referral that causes a loop, returning SERVFAIL" << endl);
     ret.clear();
     rcode = RCode::ServFail;
     return;
   }
   if (numCNAMEs > s_max_CNAMES_followed) {
+    std::cout << "[DEBUG handleNewTarget] Too many CNAMEs: " << numCNAMEs << " > " << s_max_CNAMES_followed << ", returning SERVFAIL" << std::endl;
     LOG(prefix << qname << ": Status=got a CNAME referral, but chain too long, returning SERVFAIL" << endl);
     rcode = RCode::ServFail;
     return;
@@ -6127,10 +6135,24 @@ void SyncRes::handleNewTarget(const std::string& prefix, const DNSName& qname, c
   }
 
   LOG(prefix << qname << ": Status=got a CNAME referral, starting over with " << newtarget << endl);
+  std::cout << "[DEBUG handleNewTarget] About to recursively resolve CNAME target: " << newtarget << " from " << qname << " depth=" << depth << std::endl;
 
   set<GetBestNSAnswer> beenthere;
   Context cnameContext;
-  rcode = doResolve(newtarget, qtype, ret, depth + 1, beenthere, cnameContext);
+  try {
+    rcode = doResolve(newtarget, qtype, ret, depth + 1, beenthere, cnameContext);
+    std::cout << "[DEBUG handleNewTarget] Recursive doResolve completed: rcode=" << rcode << " ret.size()=" << ret.size() << std::endl;
+  } catch (const std::bad_alloc& e) {
+    std::cerr << "[ERROR handleNewTarget] std::bad_alloc in recursive doResolve: " << e.what() << " depth=" << depth << std::endl;
+    rcode = RCode::ServFail;
+    ret.clear();
+    return;
+  } catch (const std::exception& e) {
+    std::cerr << "[ERROR handleNewTarget] Exception in recursive doResolve: " << e.what() << " depth=" << depth << std::endl;
+    rcode = RCode::ServFail;
+    ret.clear();
+    return;
+  }
   LOG(prefix << qname << ": Updating validation state for response to " << qname << " from " << state << " with the state from the CNAME quest: " << cnameContext.state << endl);
   updateValidationState(qname, state, cnameContext.state, prefix);
 }
@@ -6213,7 +6235,22 @@ bool SyncRes::processAnswer(unsigned int depth, const string& prefix, LWResult& 
   }
 
   if (!newtarget.empty()) {
-    handleNewTarget(prefix, qname, newtarget, qtype.getCode(), ret, *rcode, depth, lwr.d_records, state);
+    std::cout << "[DEBUG doResolve] CNAME detected: newtarget=" << newtarget << " qname=" << qname << " qtype=" << qtype.getCode() << " depth=" << depth << std::endl;
+    std::cout << "[DEBUG doResolve] About to call handleNewTarget for CNAME following" << std::endl;
+    try {
+      handleNewTarget(prefix, qname, newtarget, qtype.getCode(), ret, *rcode, depth, lwr.d_records, state);
+      std::cout << "[DEBUG doResolve] handleNewTarget completed successfully, rcode=" << *rcode << " ret.size()=" << ret.size() << std::endl;
+    } catch (const std::bad_alloc& e) {
+      std::cerr << "[ERROR doResolve] std::bad_alloc in handleNewTarget: " << e.what() << std::endl;
+      *rcode = RCode::ServFail;
+      ret.clear();
+      return true;
+    } catch (const std::exception& e) {
+      std::cerr << "[ERROR doResolve] Exception in handleNewTarget: " << e.what() << std::endl;
+      *rcode = RCode::ServFail;
+      ret.clear();
+      return true;
+    }
     return true;
   }
 

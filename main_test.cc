@@ -783,6 +783,12 @@ int main() {
         SyncRes::s_doIPv6 = false; // enable later when needed
         SyncRes::s_noEDNS = false;
         SyncRes::s_qnameminimization = true;
+        // Upstream: rec-main.cc:1845 - SyncRes::s_max_CNAMES_followed = ::arg().asNum("max-cnames-followed");
+        // Default: 10 (from rec-rust-lib/table.py and rust/src/lib.rs)
+        if (SyncRes::s_max_CNAMES_followed == 0) {
+            SyncRes::s_max_CNAMES_followed = 10;
+            std::cout << "[DEBUG] Initialized SyncRes::s_max_CNAMES_followed=" << SyncRes::s_max_CNAMES_followed << std::endl;
+        }
 
         std::cout << "Initialized MTasker infrastructure:" << std::endl;
         std::cout << "  - g_multiTasker: ready" << std::endl;

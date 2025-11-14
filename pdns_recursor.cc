@@ -247,13 +247,13 @@ struct RecThreadInfo {
 };
 
 // RunningResolveGuard stub (disabled)
-// NOTE: In startDoResolve, comboWriter is unique_ptr, but RunningResolveGuard expects shared_ptr
-// This stub accepts unique_ptr for compatibility
+// NOTE: Upstream RunningResolveGuard takes a reference to unique_ptr<DNSComboWriter>
+// (not shared_ptr). This stub accepts unique_ptr for compatibility.
 struct RunningResolveGuard {
   RunningResolveGuard(const std::unique_ptr<DNSComboWriter>& /* comboWriter */) { }
   RunningResolveGuard(const std::shared_ptr<DNSComboWriter>& /* comboWriter */) { }
   void setHandled() { }
-};
+};  
 
 // ========================================================================
 
